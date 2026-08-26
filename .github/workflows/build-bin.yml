@@ -1,1 +1,52 @@
+name: CI
 
+# Testy + budowa binarki zpk na każdy push/PR (dotad ten plik byl calkowicie
+# pusty -- brak jakiegokolwiek CI). Publikacja do GitHub Releases jest w
+# osobnym workflow: build-zpk.yml (wyzwalanym tagiem vX.Y).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zainstaluj Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.0"
+
+      - name: nimble install (zależności)
+        run: nimble install -d -y
+
+      - name: Testy jednostkowe (nimble test)
+        run: nimble test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.0"
+      - run: nimble install -d -y
+      - name: Buduje binarkę
+        run: nimble buildRelease
+      - name: Sanity-check (--version, --help, init+validate roundtrip)
+        run: |
+          ./bin/zpk --version
+          ./bin/zpk --help
+          mkdir -p /tmp/zpk-smoke
+          cd /tmp/zpk-smoke
+          "$GITHUB_WORKSPACE/bin/zpk" init
+          "$GITHUB_WORKSPACE/bin/zpk" validate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zpk-linux-x86_64
+          path: bin/zpk
