@@ -1,1 +1,44 @@
+name: Release
 
+# Publikuje binarke zpk do GitHub Releases pod nazwa assetu "zpk" (dotad
+# ten plik byl calkowicie pusty -- brak jakiegokolwiek release CI, mimo
+# ze zpk jest referencjonowane jako wpis w own-repository.json i zenit
+# oczekuje mozliwosci `zpm own install zpk`).
+
+on:
+  push:
+    tags:
+      - "v*.*"
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.0"
+
+      - run: nimble install -d -y
+
+      - name: Testy jednostkowe (nic nie publikujemy bez zielonych testów)
+        run: nimble test
+
+      - name: Buduje binarkę release
+        run: nimble buildRelease
+
+      - name: Suma sha256
+        run: sha256sum bin/zpk > bin/zpk.sha256
+
+      - name: Publikuj w GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/zpk
+            bin/zpk.sha256
+          generate_release_notes: true
