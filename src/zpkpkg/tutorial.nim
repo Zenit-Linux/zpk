@@ -25,11 +25,11 @@ proc askYesNo(promptKey: string, lang: string, defaultYes: bool): bool =
   raw in ["y", "yes", "t", "tak"]
 
 proc runTutorialRelease*() =
-  var lang = detectLang()
+  let lang = detectLang()
   echo "=== zpk tutorial-release ==="
   echo t("welcome", lang)
   echo ""
-  echo "(ZPK_LANG=pl|en / ZPK_LANG=pl|en to change language before next run)"
+  echo "(ZPK_LANG=pl|en -- set before running to change language)"
   echo ""
 
   let pkgDirRaw = ask("ask_pkg_dir", lang)
@@ -47,7 +47,7 @@ proc runTutorialRelease*() =
   if m.description.len > 0: echo "   " & m.description
   echo ""
 
-  var builtPath = ""
+  var builtAssets: seq[tuple[arch, path: string]] = @[]
   if askYesNo("ask_build_first", lang, true):
     echo t("building", lang)
     let outDir = pkgDir / "out"
@@ -55,8 +55,23 @@ proc runTutorialRelease*() =
     if not ok or built.len == 0:
       stderr.writeLine("✘ " & t("build_failed", lang))
       return
-    builtPath = built[0].path
+    builtAssets = built
     echo &"✔ {built.len} archiwa .zpk zbudowane w {outDir}"
+  else:
+    # Bez budowania teraz -- zakładamy nazwy plików wg konwencji dla
+    # WSZYSTKICH architektur z package.arch (mogą już istnieć z
+    # wcześniejszego `zpk build --release`); ostrzegamy, jeśli którychś
+    # brakuje, zamiast po cichu publikować URL wskazujący donikąd.
+    for arch in m.arches:
+      let candidate = pkgDir / "out" / packageFileName(m.name, m.version, arch)
+      if fileExists(candidate):
+        builtAssets.add (arch, candidate)
+      else:
+        stderr.writeLine(&"⚠ brak {candidate} -- pomijam architekturę '{arch}' przy publikacji")
+    if builtAssets.len == 0:
+      stderr.writeLine("✘ nie znaleziono żadnego wcześniej zbudowanego pliku .zpk w ./out -- " &
+        "uruchom `zpk build` albo odpowiedz \"tak\" na poprzednie pytanie.")
+      return
 
   let branch = ask("ask_branch", lang)
   var mCopy = m
@@ -71,8 +86,7 @@ proc runTutorialRelease*() =
   if findExe("gh").len == 0:
     echo t("gh_missing", lang)
 
-  let assetForRelease = if builtPath.len > 0: builtPath else: packageFileName(m.name, m.version, m.arches[0])
-  let (ok, message) = scheduleRelease(mCopy, assetForRelease, verbose = false, pkgDir = pkgDir)
+  let (ok, message) = scheduleRelease(mCopy, builtAssets, verbose = false, pkgDir = pkgDir)
   echo ""
   if ok:
     echo t("pr_created", lang)
