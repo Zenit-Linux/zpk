@@ -9,6 +9,14 @@ import std/[times]
 const ManifestSchemaVersion* = 1
 const ManifestFileName* = "manifest.json"
 
+## Architektury, które `zpk` rozpoznaje przy walidacji `zpk.build`
+## (`zpk validate` ostrzega, jeśli `package.arch` zawiera coś spoza tej
+## listy -- to prawie zawsze literówka, np. "x86-64" zamiast "x86_64").
+## Lista jest świadomie otwarta na rozszerzenie: nieznana architektura
+## to OSTRZEŻENIE, nie twardy błąd, bo Zenit Linux może kiedyś wspierać
+## coś nowego, zanim `zpk` zostanie o tym poinformowane.
+const KnownArches* = ["x86_64", "aarch64", "armv7", "riscv64", "i686"]
+
 type
   ZpkFileEntry* = object
     path*: string
@@ -24,6 +32,9 @@ type
     buildRecipe*: string
     builtAt*: string
     files*: seq[ZpkFileEntry]
+    signature*: string    ## base64, puste jeśli pakiet nie był podpisany
+                           ## (patrz zpkpkg/signing.nim, ZPK_SIGN_KEY)
+    signedWith*: string   ## etykieta klucza/algorytmu wg openssl (informacyjne)
 
   # ---- zpk.build (HCL) -- metadane budowania, OSOBNE od manifestu -----
   ZpkReleaseTarget* = object
