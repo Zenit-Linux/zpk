@@ -1,0 +1,87 @@
+name: CI
+
+# Testy + budowa binarki zpk na każdy push/PR (dotad ten plik byl calkowicie
+# pusty -- brak jakiegokolwiek CI). Publikacja do GitHub Releases jest w
+# osobnym workflow: build-zpk.yml (wyzwalanym tagiem vX.Y).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zainstaluj Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.0"
+
+      - name: nimble install (zależności)
+        run: nimble install -d -y
+
+      - name: Testy jednostkowe (nimble test)
+        run: nimble test
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: zpk-linux-x86_64
+          - os: macos-13          # macOS x86_64 (Intel) runner
+            artifact: zpk-macos-x86_64
+          - os: macos-latest      # macOS aarch64 (Apple Silicon) runner
+            artifact: zpk-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.0"
+      - run: nimble install -d -y
+      - name: Buduje binarkę
+        run: nimble buildRelease
+      - name: Sanity-check (--version, --help, init+validate+build roundtrip)
+        # Celowo NIE polega na obecności interpretera `janet` w środowisku
+        # CI (może go nie być na świeżym runnerze) -- nadpisuje recipe
+        # wygenerowane przez `zpk init` prostym skryptem `sh`, żeby
+        # sprawdzić PEŁEN cykl (init -> validate -> build -> verify), nie
+        # tylko parsowanie.
+        run: |
+          ./bin/zpk --version
+          ./bin/zpk --help
+          mkdir -p /tmp/zpk-smoke
+          cd /tmp/zpk-smoke
+          "$GITHUB_WORKSPACE/bin/zpk" init
+          cat > zpk.build << 'EOF'
+          package {
+            name    = "smoke-test"
+            version = "0.0.1"
+          }
+          recipe {
+            file = "recipe.sh"
+            lang = "sh"
+          }
+          EOF
+          cat > recipe.sh << 'EOF'
+          #!/bin/sh
+          mkdir -p "$ZPM_PACKAGE_STAGE_DIR/usr/local/bin"
+          printf '#!/bin/sh\necho smoke-test\n' > "$ZPM_PACKAGE_STAGE_DIR/usr/local/bin/smoke-test"
+          chmod +x "$ZPM_PACKAGE_STAGE_DIR/usr/local/bin/smoke-test"
+          EOF
+          "$GITHUB_WORKSPACE/bin/zpk" validate
+          "$GITHUB_WORKSPACE/bin/zpk" build --verbose
+          "$GITHUB_WORKSPACE/bin/zpk" verify out/smoke-test-0.0.1-x86_64.zpk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: bin/zpk
