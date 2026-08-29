@@ -1,4 +1,4 @@
-version       = "0.1.0"
+version       = "0.2.0"
 author        = "Zenit Linux Developers"
 description   = "zpk -- oficjalny builder pakietow .zpk dla zpm (Zenit Linux)"
 license       = "GPL-3.0"
