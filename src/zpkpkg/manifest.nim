@@ -1,4 +1,4 @@
-import std/[os, strutils, strformat, sets]
+import std/[os, strutils, strformat, sets, tables]
 import ./hcl
 import ./types
 
@@ -15,7 +15,7 @@ proc isValidPackageName(name: string): bool =
     if c notin namePattern: return false
   true
 
-proc isValidSemver(version: string): bool =
+proc isValidSemver*(version: string): bool =
   ## Luźna walidacja semver: MAJOR.MINOR.PATCH z opcjonalnym
   ## sufiksem "-prerelease" (np. "1.2.3-rc1") -- wystarczające dla
   ## `zpk`, które i tak tylko wstawia `version` do nazw plików i URL-i
@@ -114,6 +114,21 @@ proc loadZpkBuild*(path: string): ZpkBuildManifest =
   let recipeFile = if recipeBlk != nil: recipeBlk.getStr("file", "recipe.janet") else: "recipe.janet"
   let recipeLang = if recipeBlk != nil: recipeBlk.getStr("lang", "janet") else: "janet"
 
+  # `toolchains { arch = "prefiks-" }` -- OPCJONALNY blok, patrz
+  # types.nim (pole ZpkBuildManifest.toolchains) i builder.nim (jak
+  # prefiks jest używany do ustawienia CC/CXX/AR/STRIP dla recipe przy
+  # cross-budowaniu). Klucze to nazwy dowolnych architektur (nie tylko
+  # z KnownArches -- świadomie, żeby nie blokować nietypowych targetów),
+  # wartości MUSZĄ być stringami (inne typy są po cichu pomijane, żeby
+  # literówka w typie nie wywalała całego builda -- `zpk validate`
+  # i tak by tego nie złapał precyzyjniej niż ostrzeżeniem).
+  var toolchains = initTable[string, string]()
+  let toolchainsBlk = root.findBlock("toolchains")
+  if toolchainsBlk != nil:
+    for key, val in toolchainsBlk.attrs:
+      if val.kind == hvString:
+        toolchains[key] = val.strVal
+
   var release = ZpkReleaseTarget(
     repo: "https://github.com/Zenit-Linux/own-repository",
     repoFile: "repo/own-repository.json",
@@ -134,7 +149,7 @@ proc loadZpkBuild*(path: string): ZpkBuildManifest =
     description: pkgBlk.getStr("description", ""),
     dependsOn: pkgBlk.getList("depends_on"),
     recipeFile: recipeFile, recipeLang: recipeLang,
-    release: release, rawPath: path
+    release: release, rawPath: path, toolchains: toolchains
   )
 
 proc validateZpkBuildFull*(m: ZpkBuildManifest, pkgDir: string): seq[string] =
