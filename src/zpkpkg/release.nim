@@ -108,27 +108,75 @@ proc upsertIntoOwnRepository*(repoJsonPath, assetName, description: string, depe
   writeFile(repoJsonPath, root.pretty() & "\n")
   true
 
-proc ensureReleaseAsset(releaseRepo, tag, assetPath: string, verbose: bool): tuple[ok: bool, message: string] =
+proc verifyAssetPresent*(releaseRepo, tag, assetFileName: string, verbose: bool): bool =
+  ## Potwierdza, że `assetFileName` FAKTYCZNIE figuruje na liście assetów
+  ## Release'u `tag` -- odpytuje `gh release view --json assets` zamiast
+  ## ufać wyłącznie kodowi wyjścia poprzedniej komendy `create`/`upload`
+  ## (kod wyjścia 0 mówi tylko "polecenie się zakończyło", nie "asset na
+  ## pewno tam jest" -- np. przy przerwanym połączeniu w trakcie uploadu
+  ## `gh` bywa niekonsekwentne w kodach wyjścia w zależności od wersji).
+  let repoSlug = releaseRepo.replace("https://github.com/", "")
+  let cmd = &"gh release view {quoteShell(tag)} --repo {quoteShell(repoSlug)} " &
+    "--json assets --jq \".assets[].name\""
+  if verbose: echo &"[zpk] $ {cmd}"
+  let (output, code) = sh(cmd)
+  if code != 0:
+    # Starsze `gh` mogą nie wspierać --json/--jq -- nie traktuj tego jako
+    # dowodu, że upload się nie udał, tylko że NIE MOŻEMY zweryfikować.
+    if verbose: echo &"[zpk] ⚠ nie udało się zweryfikować listy assetów (stara wersja gh?): {output}"
+    return true
+  for line in output.splitLines():
+    if line.strip() == assetFileName: return true
+  false
+
+proc ensureReleaseAsset*(releaseRepo, tag, assetPath: string, verbose: bool): tuple[ok: bool, message: string] =
   ## Tworzy (jeśli brakuje) GitHub Release `tag` w `releaseRepo` i wgrywa
   ## `assetPath` -- wymaga `gh`. Wcześniej `zpk` NIGDY tego nie robiło:
   ## tylko zakładało istnienie Release'u pod przewidywalnym URL-em.
+  ##
+  ## NAPRAWIONE (usunięcie race condition): poprzednia wersja najpierw
+  ## robiła `gh release view` (sprawdź czy istnieje), a POTEM `create`
+  ## albo `upload` w zależności od wyniku -- między tymi dwiema
+  ## komendami jest okno czasowe, w którym RÓWNOLEGŁY bieg CI (np. dwa
+  ## joby macierzy budujące różne architektury tego samego release'u)
+  ## mógł stworzyć release jako pierwszy, przez co nasz `create`
+  ## kończyłby się błędem "already exists". Teraz próbujemy `create`
+  ## OD RAZU; jeśli się nie uda (release już istnieje -- czy to dlatego,
+  ## że sami go stworzyliśmy w poprzedniej iteracji, czy dlatego, że
+  ## zrobił to ktoś inny w międzyczasie -- oba przypadki wyglądają
+  ## identycznie z zewnątrz), automatycznie próbujemy `upload --clobber`
+  ## zamiast się poddawać. Jeden mniej network round-trip, brak okna na
+  ## race, ta sama końcowa poprawność.
   if findExe("gh").len == 0:
     return (false, "'gh' niedostępne -- nie mogę automatycznie utworzyć/zaktualizować " &
       &"GitHub Release ani wgrać assetu. Zrób to ręcznie: `gh release create {tag} " &
       quoteShell(assetPath) & &" --repo {releaseRepo}` (albo odpowiednik przez UI GitHuba).")
   let repoSlug = releaseRepo.replace("https://github.com/", "")
-  let (_, viewCode) = sh(&"gh release view {quoteShell(tag)} --repo {quoteShell(repoSlug)}")
-  var cmd: string
-  if viewCode == 0:
-    cmd = &"gh release upload {quoteShell(tag)} {quoteShell(assetPath)} --repo {quoteShell(repoSlug)} --clobber"
-  else:
-    cmd = &"gh release create {quoteShell(tag)} {quoteShell(assetPath)} --repo {quoteShell(repoSlug)} " &
-      &"--title {quoteShell(tag)} --generate-notes"
-  if verbose: echo &"[zpk] $ {cmd}"
-  let (output, code) = sh(cmd)
+
+  let createCmd = &"gh release create {quoteShell(tag)} {quoteShell(assetPath)} " &
+    &"--repo {quoteShell(repoSlug)} --title {quoteShell(tag)} --generate-notes"
+  if verbose: echo &"[zpk] $ {createCmd}"
+  var (output, code) = sh(createCmd)
+
   if code != 0:
-    return (false, &"nie udało się utworzyć/zaktualizować Release '{tag}' w {releaseRepo}: {output}")
-  (true, &"Release '{tag}' w {releaseRepo}: asset {extractFilename(assetPath)} wgrany.")
+    # `create` zawiodło -- najprawdopodobniej release już istnieje
+    # (utworzony wcześniej albo właśnie przez inny równoległy bieg).
+    # Spróbuj `upload --clobber` zamiast od razu zgłaszać błąd.
+    let uploadCmd = &"gh release upload {quoteShell(tag)} {quoteShell(assetPath)} " &
+      &"--repo {quoteShell(repoSlug)} --clobber"
+    if verbose: echo &"[zpk] $ {uploadCmd}"
+    let (uploadOutput, uploadCode) = sh(uploadCmd)
+    if uploadCode != 0:
+      return (false, &"nie udało się utworzyć ANI wgrać assetu do Release '{tag}' w {releaseRepo}.\n" &
+        &"  gh release create: {output}\n  gh release upload --clobber: {uploadOutput}")
+    output = uploadOutput
+
+  if not verifyAssetPresent(releaseRepo, tag, extractFilename(assetPath), verbose):
+    return (false, &"polecenie gh zwróciło sukces, ale asset '{extractFilename(assetPath)}' NIE figuruje " &
+      &"na liście assetów Release '{tag}' po weryfikacji (gh release view --json assets) -- upload mógł " &
+      "się nie udać mimo kodu wyjścia 0. Sprawdź ręcznie na GitHubie.")
+
+  (true, &"Release '{tag}' w {releaseRepo}: asset {extractFilename(assetPath)} wgrany i zweryfikowany.")
 
 proc scheduleRelease*(m: ZpkBuildManifest, builtAssets: seq[tuple[arch, path: string]], verbose: bool,
                        pkgDir: string = ".", workDir: string = "", dryRun: bool = false,
