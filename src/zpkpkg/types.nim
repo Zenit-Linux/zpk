@@ -1,4 +1,4 @@
-import std/[times]
+import std/[times, tables]
 
 ## Schemat `ZpkManifest`/`ZpkFileEntry` MUSI zostać zgodny 1:1 z tym, co
 ## zpm (src/zpmpkg/zpk.nim) umie zainstalować -- `zpk` to OFICJALNY
@@ -61,6 +61,12 @@ type
     recipeLang*: string       ## domyślnie "janet"
     release*: ZpkReleaseTarget
     rawPath*: string          ## ścieżka do zpk.build, z którego to pochodzi (do komunikatów błędów)
+    toolchains*: Table[string, string]
+      ## opcjonalny blok `toolchains { arch = "prefiks-" }` w zpk.build --
+      ## przy budowaniu dla danej architektury `zpk` ustawia recipe
+      ## zmienne CC/CXX/AR/STRIP na `<prefiks>gcc` itd. (patrz builder.nim,
+      ## sekcja "cross-kompilacja"). Puste = brak skonfigurowanego
+      ## toolchaina dla żadnej architektury (zachowanie jak wcześniej).
 
 proc nowIso8601*(): string =
   now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
