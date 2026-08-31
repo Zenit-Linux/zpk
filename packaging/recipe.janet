@@ -1,5 +1,3 @@
-(import os)
-
 (def stage (os/getenv "ZPM_PACKAGE_STAGE_DIR"))
 
 (defn fail [msg]
