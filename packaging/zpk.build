@@ -1,1 +1,18 @@
+package {
+  name        = "zpk"
+  version     = "0.2.0"
+  arch        = ["x86_64", "aarch64"]
+  description = "Oficjalny builder pakietow .zpk dla zpm (Zenit Linux)"
+  depends_on  = []
+}
 
+recipe {
+  file = "recipe.janet"
+  lang = "janet"
+}
+
+release {
+  repo       = "https://github.com/Zenit-Linux/own-repository"
+  repo_file  = "repo/own-repository.json"
+  asset_name = "zpk"
+}
