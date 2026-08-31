@@ -5,58 +5,62 @@ import ./builder
 import ./release
 import ./i18n
 
-## `zpk tutorial-release` -- "tui masz tam pytania odpowiedzi mozesz sobie
-## wyszukac wszystko szczegolowo opisane i mozna rowniez zmieniac jezyki"
-## (cytat z wymagań). To jest interaktywny wizard oparty na pytaniach w
-## terminalu (nie pełnoekranowe ncurses -- świadomie: najprostsza forma,
-## która działa identycznie w KAŻDYM terminalu/CI-log bez zależności od
-## biblioteki TUI, a i tak realizuje "pytania -> odpowiedzi -> publikacja").
-## Język: ZPK_LANG=pl|en (patrz i18n.nim) -- można zmienić PRZED
-## uruchomieniem, albo w trakcie odpowiadając na pierwsze pytanie.
+## `zpk tutorial-release` -- interaktywny kreator w terminalu (pytanie
+## po pytaniu), z wyborem języka przez ZPK_LANG=pl|en (patrz i18n.nim).
+##
+## `input`/`output` są PARAMETRAMI (domyślnie prawdziwe stdin/stdout) --
+## nie odwołujemy się do globalnych `stdin`/`stdout` bezpośrednio
+## wewnątrz logiki, tylko przekazujemy je jawnie przez cały wywołań
+## łańcuch. Dzięki temu `runTutorialRelease` można przetestować
+## end-to-end (podając plik z "odpowiedziami" jako `input` i przechwytując
+## `output`), bez podmieniania globalnego stdin procesu -- wcześniej
+## kreator był kompletnie nietestowalny.
 
-proc ask(promptKey: string, lang: string): string =
-  stdout.write("? " & t(promptKey, lang) & "\n> ")
-  stdout.flushFile()
-  result = readLine(stdin).strip()
+proc ask(promptKey: string, lang: string, input, output: File): string =
+  output.write("? " & t(promptKey, lang) & "\n> ")
+  output.flushFile()
+  result = (if input.endOfFile: "" else: readLine(input)).strip()
 
-proc askYesNo(promptKey: string, lang: string, defaultYes: bool): bool =
-  let raw = ask(promptKey, lang).toLowerAscii
+proc askYesNo(promptKey: string, lang: string, defaultYes: bool, input, output: File): bool =
+  let raw = ask(promptKey, lang, input, output).toLowerAscii
   if raw.len == 0: return defaultYes
   raw in ["y", "yes", "t", "tak"]
 
-proc runTutorialRelease*() =
+proc runTutorialRelease*(input: File = stdin, output: File = stdout, pkgDirOverride: string = "") =
   let lang = detectLang()
-  echo "=== zpk tutorial-release ==="
-  echo t("welcome", lang)
-  echo ""
-  echo "(ZPK_LANG=pl|en -- set before running to change language)"
-  echo ""
+  output.writeLine "=== zpk tutorial-release ==="
+  output.writeLine t("welcome", lang)
+  output.writeLine ""
+  output.writeLine "(ZPK_LANG=pl|en -- set before running to change language)"
+  output.writeLine ""
 
-  let pkgDirRaw = ask("ask_pkg_dir", lang)
-  let pkgDir = if pkgDirRaw.len > 0: pkgDirRaw else: getCurrentDir()
+  let pkgDirRaw = ask("ask_pkg_dir", lang, input, output)
+  let pkgDir = if pkgDirRaw.len > 0: pkgDirRaw
+               elif pkgDirOverride.len > 0: pkgDirOverride
+               else: getCurrentDir()
   let buildFilePath = pkgDir / "zpk.build"
 
   var m: ZpkBuildManifest
   try:
     m = loadZpkBuild(buildFilePath)
   except ZpkError as e:
-    stderr.writeLine("✘ " & e.msg)
+    output.writeLine("✘ " & e.msg)
     return
 
-  echo &"\n>> {m.name} {m.version} ({m.arches.join(\", \")})"
-  if m.description.len > 0: echo "   " & m.description
-  echo ""
+  output.writeLine &"\n>> {m.name} {m.version} ({m.arches.join(\", \")})"
+  if m.description.len > 0: output.writeLine "   " & m.description
+  output.writeLine ""
 
   var builtAssets: seq[tuple[arch, path: string]] = @[]
-  if askYesNo("ask_build_first", lang, true):
-    echo t("building", lang)
+  if askYesNo("ask_build_first", lang, true, input, output):
+    output.writeLine t("building", lang)
     let outDir = pkgDir / "out"
     let (ok, built) = buildAll(pkgDir, m, outDir, verbose = false)
     if not ok or built.len == 0:
-      stderr.writeLine("✘ " & t("build_failed", lang))
+      output.writeLine("✘ " & t("build_failed", lang))
       return
     builtAssets = built
-    echo &"✔ {built.len} archiwa .zpk zbudowane w {outDir}"
+    output.writeLine &"✔ {built.len} archiwa .zpk zbudowane w {outDir}"
   else:
     # Bez budowania teraz -- zakładamy nazwy plików wg konwencji dla
     # WSZYSTKICH architektur z package.arch (mogą już istnieć z
@@ -67,29 +71,29 @@ proc runTutorialRelease*() =
       if fileExists(candidate):
         builtAssets.add (arch, candidate)
       else:
-        stderr.writeLine(&"⚠ brak {candidate} -- pomijam architekturę '{arch}' przy publikacji")
+        output.writeLine(&"⚠ brak {candidate} -- pomijam architekturę '{arch}' przy publikacji")
     if builtAssets.len == 0:
-      stderr.writeLine("✘ nie znaleziono żadnego wcześniej zbudowanego pliku .zpk w ./out -- " &
+      output.writeLine("✘ nie znaleziono żadnego wcześniej zbudowanego pliku .zpk w ./out -- " &
         "uruchom `zpk build` albo odpowiedz \"tak\" na poprzednie pytanie.")
       return
 
-  let branch = ask("ask_branch", lang)
+  let branch = ask("ask_branch", lang, input, output)
   var mCopy = m
   mCopy.release.branch = branch
 
-  echo ""
-  if not askYesNo("ask_confirm_pr", lang, false):
-    echo t("pr_skipped", lang)
-    echo t("goodbye", lang)
+  output.writeLine ""
+  if not askYesNo("ask_confirm_pr", lang, false, input, output):
+    output.writeLine t("pr_skipped", lang)
+    output.writeLine t("goodbye", lang)
     return
 
   if findExe("gh").len == 0:
-    echo t("gh_missing", lang)
+    output.writeLine t("gh_missing", lang)
 
   let (ok, message) = scheduleRelease(mCopy, builtAssets, verbose = false, pkgDir = pkgDir)
-  echo ""
+  output.writeLine ""
   if ok:
-    echo t("pr_created", lang)
-  echo message
-  echo ""
-  echo t("goodbye", lang)
+    output.writeLine t("pr_created", lang)
+  output.writeLine message
+  output.writeLine ""
+  output.writeLine t("goodbye", lang)
