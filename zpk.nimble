@@ -7,7 +7,8 @@ bin           = @["zpk"]
 binDir        = "bin"
 
 requires "nim >= 2.0.0"
-requires "hcl_nim >= 0.1"
+
+requires "hcl_nim >= 0.1.0"
 
 task test, "Uruchamia testy jednostkowe":
   exec "nim c -d:ssl -r --out:bin/test_core tests/test_core.nim"
