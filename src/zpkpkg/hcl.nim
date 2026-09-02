@@ -1,4 +1,5 @@
-import std/[strutils, tables, strformat]
+import std/[tables, strutils, strformat]
+import hclnim as hcln
 
 type
   HclValueKind* = enum
@@ -19,188 +20,177 @@ type
 
   HclParseError* = object of CatchableError
     ## Rzucany z NUMEREM LINII w komunikacie -- celowo zamiast po cichu
-    ## mis-parsować (np. traktować niedomknięty blok jako pusty string),
-    ## bo cichy błąd konfiguracji w produkcyjnym `/etc/zpm/config.hcl`
-    ## jest dużo gorszy niż `quit(1)` z jasnym miejscem problemu.
+    ## mis-parsować, bo cichy błąd konfiguracji w produkcyjnym
+    ## `zpk.build` jest dużo gorszy niż `quit(1)` z jasnym miejscem
+    ## problemu. Patrz też komentarz modułu wyżej.
 
 proc newHclBlock*(name: string): HclBlock =
   HclBlock(name: name, attrs: initTable[string, HclValue](), children: @[])
 
-proc unescapeHclString(inner: string, lineNo: int): string =
-  ## Obsługuje `\"` i `\\` wewnątrz stringów HCL (np. ścieżki Windows albo
-  ## URL-e z escapowanym cudzysłowem) -- bez tego `"a \" b"` było po
-  ## prostu ucinane na pierwszym escapowanym cudzysłowie bez ostrzeżenia.
-  result = newStringOfCap(inner.len)
-  var i = 0
-  while i < inner.len:
-    if inner[i] == '\\' and i + 1 < inner.len and inner[i+1] in {'"', '\\'}:
-      result.add inner[i+1]
-      i += 2
-    elif inner[i] == '\\' and i + 1 >= inner.len:
-      raise newException(HclParseError, &"linia {lineNo}: string urwany na znaku ucieczki '\\' na końcu linii")
-    else:
-      result.add inner[i]
-      inc i
+# --- obejście buga hcl_nim przy liczbach ze znakiem ------------------------
 
-proc readQuotedString(v: string, startIdx: int, lineNo: int): tuple[value: string, nextIdx: int] =
-  ## Czyta string w cudzysłowie zaczynający się w `v[startIdx]` (który musi
-  ## być '"'). Zwraca ODESCAPOWANĄ zawartość oraz indeks TUŻ ZA zamykającym
-  ## cudzysłowem. Współdzielone przez parseValue (pojedyncza wartość) i
-  ## splitHclList (elementy listy) -- wcześniej lista dzieliła po samym
-  ## przecinku, więc element `"a,b"` (przecinek WEWNĄTRZ cudzysłowu) się
-  ## rozjeżdżał na dwa elementy; teraz oba miejsca parsują stringi tak samo.
-  var j = startIdx + 1
-  while j < v.len:
-    if v[j] == '"' and v[j-1] != '\\':
-      return (unescapeHclString(v[startIdx+1 ..< j], lineNo), j + 1)
-    inc j
-  raise newException(HclParseError, &"linia {lineNo}: niedomknięty string (brakujący końcowy '\"')")
-
-proc looksNumeric(v: string): bool =
+proc looksNumericZpk(v: string): bool =
+  ## To samo kryterium co w oryginalnym, ręcznym parserze zpk sprzed
+  ## migracji: opcjonalny wiodący `+`/`-`, potem sama mieszanka cyfr i
+  ## kropek (w tym `.5` bez wiodącego zera), z opcjonalnym wykładnikiem
+  ## `e`/`E`. Musi trafić choć jedną cyfrę.
   if v.len == 0: return false
   var i = 0
-  if v[0] == '-' or v[0] == '+': i = 1
+  if v[0] == '-' or v[0] == '+': inc i
   if i >= v.len: return false
   var sawDigit = false
+  var sawExp = false
   while i < v.len:
-    if v[i].isDigit: sawDigit = true
-    elif v[i] == '.': discard
-    else: return false
+    let c = v[i]
+    if c.isDigit:
+      sawDigit = true
+    elif c == '.':
+      discard
+    elif (c == 'e' or c == 'E') and sawDigit and not sawExp:
+      sawExp = true
+      inc i
+      if i < v.len and (v[i] == '+' or v[i] == '-'): inc i
+      continue
+    else:
+      return false
     inc i
   sawDigit
 
-proc splitHclList(inner: string, lineNo: int): seq[string] =
-  ## Dzieli zawartość listy `["a", "b, c", "d"]` (bez nawiasów kwadratowych)
-  ## na elementy, respektując przecinki WEWNĄTRZ cudzysłowów -- naiwny
-  ## `inner.split(',')` (wcześniejsza implementacja) łamał listy typu
-  ## `["a,b", "c"]` na trzy elementy zamiast dwóch.
-  result = @[]
-  var i = 0
-  while i < inner.len:
-    while i < inner.len and inner[i] in {' ', '\t'}: inc i
-    if i >= inner.len: break
-    if inner[i] == '"':
-      let (s, nextIdx) = readQuotedString(inner, i, lineNo)
-      result.add s
-      i = nextIdx
-    else:
-      # element niecudzysłowiony (np. liczba) -- czytaj do przecinka
-      var j = i
-      while j < inner.len and inner[j] != ',': inc j
-      let piece = inner[i ..< j].strip()
-      if piece.len > 0: result.add piece
-      i = j
-    while i < inner.len and inner[i] in {' ', '\t'}: inc i
-    if i < inner.len and inner[i] == ',':
-      inc i
-    elif i < inner.len:
-      raise newException(HclParseError, &"linia {lineNo}: oczekiwano ',' albo ']' w liście, znaleziono '{inner[i]}'")
+proc recoverSignedNumber(exprSrc: string): string =
+  ## `hcl_nim` skleja rozjechane tokeny liczby ze znakiem spacją (patrz
+  ## komentarz modułu) -- oryginalny tekst źródłowy nigdy nie miał tam
+  ## spacji, więc ich usunięcie bezpiecznie odtwarza to, co użytkownik
+  ## faktycznie napisał (`"-2 .5"` -> `"-2.5"`).
+  exprSrc.replace(" ", "")
 
-proc parseValue(raw: string, lineNo: int): HclValue =
-  let v = raw.strip()
-  if v.len == 0:
-    raise newException(HclParseError, &"linia {lineNo}: brak wartości po '=' (pusta prawa strona)")
-  if v[0] == '"':
-    let (s, nextIdx) = readQuotedString(v, 0, lineNo)
-    if v[nextIdx .. ^1].strip().len > 0:
-      raise newException(HclParseError, &"linia {lineNo}: nieoczekiwane znaki po zamkniętym stringu")
-    result = HclValue(kind: hvString, strVal: s)
-  elif v == "true" or v == "false":
-    result = HclValue(kind: hvBool, boolVal: v == "true")
-  elif v[0] == '[':
-    if v[^1] != ']':
-      raise newException(HclParseError, &"linia {lineNo}: niedomknięta lista (brakujący końcowy ']')")
-    let items = splitHclList(v[1 ..< v.high], lineNo)
-    result = HclValue(kind: hvList, listVal: items)
-  elif looksNumeric(v):
-    if '.' in v:
-      try:
-        result = HclValue(kind: hvFloat, floatVal: parseFloat(v))
-      except ValueError:
-        raise newException(HclParseError, &"linia {lineNo}: nieprawidłowa liczba zmiennoprzecinkowa '{v}'")
-    else:
-      try:
-        result = HclValue(kind: hvInt, intVal: parseInt(v))
-      except ValueError:
-        raise newException(HclParseError, &"linia {lineNo}: nieprawidłowa liczba całkowita '{v}'")
+# --- konwersja drzewa hcl_nim -> wąski model zpk ---------------------------
+
+proc stripLineCol(rawMsg: string): string =
+  ## Komunikaty błędów hcl_nim kończą się " (line N, col M)" -- ten
+  ## fragment i tak dublujemy własnym "linia {N}: " na przedzie (patrz
+  ## `wrapAsHclParseError`), więc obcinamy go, żeby nie pokazywać tego
+  ## samego numeru linii dwa razy w jednym komunikacie.
+  let idx = rawMsg.rfind(" (line ")
+  if idx >= 0: rawMsg[0 ..< idx] else: rawMsg
+
+proc wrapAsHclParseError(line: int, msg: string): ref HclParseError =
+  newException(HclParseError, &"linia {line}: {stripLineCol(msg)}")
+
+proc parseRecoveredNumber(line: int, joined: string): HclValue =
+  if '.' in joined or 'e' in joined or 'E' in joined:
+    try:
+      HclValue(kind: hvFloat, floatVal: parseFloat(joined))
+    except ValueError:
+      raise wrapAsHclParseError(line, &"nieprawidłowa liczba zmiennoprzecinkowa '{joined}'")
   else:
-    # Nieznana, niecudzysłowiona wartość (np. literówka zamiast "true"/
-    # liczby/listy/stringa w cudzysłowie) -- zamiast cicho przyjąć to
-    # jako string dosłownie, ostrzegamy: to niemal zawsze błąd configu.
-    raise newException(HclParseError,
-      &"linia {lineNo}: nierozpoznana wartość '{v}' -- oczekiwano stringa w cudzysłowach, " &
+    try:
+      HclValue(kind: hvInt, intVal: parseInt(joined))
+    except ValueError:
+      raise wrapAsHclParseError(line, &"nieprawidłowa liczba całkowita '{joined}'")
+
+proc describeUnsupported(n: hcln.HclNode): string =
+  ## Tekst wartości do komunikatu błędu dla węzłów spoza wąskiego
+  ## podzbioru, jaki `zpk.build` rozumie (patrz `convertValue`).
+  case n.kind
+  of hcln.nkExpr: n.exprSrc
+  of hcln.nkNull: "null"
+  of hcln.nkObject: "{ ... }"
+  of hcln.nkHeredoc: "<<" & n.heredocTag & " ... " & n.heredocTag
+  else: "?"
+
+proc scalarToString(n: hcln.HclNode): string =
+  ## Element listy zredukowany do "surowego" stringa -- zgodnie z
+  ## dotychczasowym modelem `HclValue.hvList: seq[string]` (patrz
+  ## `manifest.nim`/`getList`), gdzie lista jest zawsze listą stringów
+  ## niezależnie od tego, czy w źródle element miał cudzysłów, czy był
+  ## liczbą/bool-em. Nieujęty w cudzysłów, nierozpoznany element listy
+  ## był w oryginalnym parserze zawsze przyjmowany dosłownie (bez
+  ## walidacji) -- ta sama tolerancja jest zachowana tutaj dla `nkExpr`,
+  ## które nie da się odzyskać jako liczba.
+  case n.kind
+  of hcln.nkString: n.strVal
+  of hcln.nkNumber:
+    if n.isInt: $n.intVal else: $n.numVal
+  of hcln.nkBool: $n.boolVal
+  of hcln.nkExpr:
+    let joined = recoverSignedNumber(n.exprSrc)
+    if looksNumericZpk(joined): joined else: n.exprSrc
+  else:
+    raise wrapAsHclParseError(n.line,
+      &"nierozpoznany element listy '{describeUnsupported(n)}' -- " &
+      "oczekiwano stringa w cudzysłowach, liczby, albo true/false")
+
+proc convertValue(n: hcln.HclNode): HclValue =
+  case n.kind
+  of hcln.nkString:
+    HclValue(kind: hvString, strVal: n.strVal)
+  of hcln.nkNumber:
+    if n.isInt:
+      HclValue(kind: hvInt, intVal: int(n.intVal))
+    else:
+      HclValue(kind: hvFloat, floatVal: n.numVal)
+  of hcln.nkBool:
+    HclValue(kind: hvBool, boolVal: n.boolVal)
+  of hcln.nkList:
+    var items: seq[string] = @[]
+    for it in n.items: items.add scalarToString(it)
+    HclValue(kind: hvList, listVal: items)
+  of hcln.nkExpr:
+    let joined = recoverSignedNumber(n.exprSrc)
+    if looksNumericZpk(joined):
+      parseRecoveredNumber(n.line, joined)
+    else:
+      raise wrapAsHclParseError(n.line,
+        &"nierozpoznana wartość '{n.exprSrc}' -- oczekiwano stringa w cudzysłowach, " &
+        "liczby (w tym ujemnej/zmiennoprzecinkowej), true/false albo listy [\"a\",\"b\"]")
+  else:
+    raise wrapAsHclParseError(n.line,
+      &"nierozpoznana wartość '{describeUnsupported(n)}' -- oczekiwano stringa w cudzysłowach, " &
       "liczby (w tym ujemnej/zmiennoprzecinkowej), true/false albo listy [\"a\",\"b\"]")
 
-proc parseHcl*(source: string): HclBlock =
-  ## Parsuje cały dokument HCL, zwracając "wirtualny" blok główny (root),
-  ## którego `children` to bloki najwyższego poziomu, a `attrs` to
-  ## atrybuty zdefiniowane poza blokami. Rzuca `HclParseError` (z numerem
-  ## linii) przy niedomkniętym bloku/stringu/liście albo nierozpoznanej
-  ## wartości -- zamiast po cichu zwrócić coś innego, niż operator napisał.
-  ##
-  ## UWAGA: parseHcl NIE odrzuca sam z siebie wielu bloków o tej samej
-  ## nazwie na tym samym poziomie (`package {} ... package {}`) -- to
-  ## sprawdza wywołujący (manifest.nim), który zna semantykę "jeden
-  ## `package{}` na plik `zpk.build`"; parser HCL jako taki jest formatem
-  ## ogólnego przeznaczenia i nie powinien tego narzucać.
-  result = newHclBlock("root")
-  var stack: seq[HclBlock] = @[result]
-  var openLines: seq[int] = @[0]  ## linia otwarcia każdego bloku na stosie (root = 0)
-
-  for idx, rawLine in source.splitLines().pairs():
-    let lineNo = idx + 1
-    var line = rawLine.strip()
-    # usuń komentarze (# lub //), ale NIE wewnątrz cudzysłowów
-    line = block:
-      var inStr = false
-      var cut = line.len
-      var k = 0
-      while k < line.len:
-        if line[k] == '"' and (k == 0 or line[k-1] != '\\'): inStr = not inStr
-        elif not inStr and line[k] == '#':
-          cut = k; break
-        elif not inStr and line[k] == '/' and k + 1 < line.len and line[k+1] == '/':
-          cut = k; break
-        inc k
-      line[0 ..< cut].strip()
-    if line.len == 0: continue
-
-    if line.endsWith("{"):
-      var header = line[0 ..< line.high].strip()
-      var blockName = header
-      let quoteStart = header.find('"')
-      if quoteStart >= 0:
-        let quoteEnd = header.rfind('"')
-        if quoteEnd <= quoteStart:
-          raise newException(HclParseError, &"linia {lineNo}: niedomknięty string w nagłówku bloku")
-        blockName = header[quoteStart+1 ..< quoteEnd]
-      else:
-        blockName = header.strip()
-      if blockName.len == 0:
-        raise newException(HclParseError, &"linia {lineNo}: blok bez nazwy przed '{{'")
-      let blk = newHclBlock(blockName)
-      stack[^1].children.add(blk)
-      stack.add(blk)
-      openLines.add(lineNo)
-    elif line == "}":
-      if stack.len <= 1:
-        raise newException(HclParseError, &"linia {lineNo}: nadmiarowy '}}' bez odpowiadającego otwarcia")
-      discard stack.pop()
-      discard openLines.pop()
-    elif '=' in line:
-      let idxEq = line.find('=')
-      let key = line[0 ..< idxEq].strip()
-      if key.len == 0:
-        raise newException(HclParseError, &"linia {lineNo}: brak nazwy klucza przed '='")
-      let valRaw = line[idxEq+1 .. ^1].strip()
-      stack[^1].attrs[key] = parseValue(valRaw, lineNo)
+proc convertBody(items: seq[hcln.HclNode], blk: HclBlock) =
+  for item in items:
+    case item.kind
+    of hcln.nkAttribute:
+      blk.attrs[item.name] = convertValue(item.value)
+    of hcln.nkBlock:
+      let child = newHclBlock(item.blockType)
+      convertBody(item.blockBody, child)
+      blk.children.add child
     else:
-      raise newException(HclParseError,
-        &"linia {lineNo}: nierozpoznana linia (oczekiwano 'blok {{', '}}' albo 'klucz = wartość'): {line}")
+      discard  # parser hcl_nim nie generuje innych węzłów na poziomie "body"
 
-  if stack.len > 1:
-    raise newException(HclParseError,
-      &"niedomknięty blok '{stack[^1].name}' otwarty w linii {openLines[^1]} (brakujący '}}' do końca pliku)")
+proc parseHcl*(source: string): HclBlock =
+  ## Parsuje cały dokument HCL (silnik: hcl_nim, patrz komentarz modułu
+  ## wyżej) i zwraca "wirtualny" blok główny (root), którego `children`
+  ## to bloki najwyższego poziomu, a `attrs` to atrybuty zdefiniowane
+  ## poza blokami -- dokładnie jak przed migracją na hcl_nim. Rzuca
+  ## `HclParseError` (z numerem linii) przy niedomkniętym
+  ## bloku/stringu/liście albo nierozpoznanej/niewspieranej wartości.
+  ##
+  ## UWAGA: `parseHcl` sam z siebie NIE odrzuca wielu bloków o tej
+  ## samej nazwie na tym samym poziomie (`package {} ... package {}`)
+  ## -- to sprawdza wywołujący (`manifest.nim`, który zna semantykę
+  ## "jeden `package{}` na plik `zpk.build`"); ten moduł jako taki jest
+  ## adapterem ogólnego formatu i nie powinien tego narzucać.
+  var doc: hcln.HclNode
+  try:
+    doc = hcln.parseHcl(source, hcln.hcl2)
+  except hcln.HclLexError as e:
+    raise wrapAsHclParseError(e.line, e.msg)
+  except hcln.HclParseError as e:
+    raise wrapAsHclParseError(e.line, e.msg)
+  except hcln.HclError as e:
+    # Nie powinno się zdarzyć -- HclLexError/HclParseError to jedyne
+    # podklasy, jakie hcl_nim obecnie rzuca -- ale gdyby przybyła nowa,
+    # i tak zgłaszamy to jako błąd configu zamiast dać jej przeciekać
+    # jako surowy, nieudokumentowany wyjątek z zależności.
+    raise newException(HclParseError, &"błąd parsowania HCL: {e.msg}")
+
+  result = newHclBlock("root")
+  convertBody(doc.body, result)
+
+# --- akcesory (bez zmian względem wersji sprzed migracji) ------------------
 
 proc getStr*(blk: HclBlock, key: string, default = ""): string =
   if blk.attrs.hasKey(key) and blk.attrs[key].kind == hvString:
@@ -237,9 +227,7 @@ proc findAllBlocks*(blk: HclBlock, name: string): seq[HclBlock] =
   ## przeciwieństwie do `findBlock`, które po cichu zwraca tylko
   ## pierwsze trafienie. Używane w manifest.nim do wykrywania
   ## przypadkowo zduplikowanych bloków `package { }` / `recipe { }` /
-  ## `release { }` w `zpk.build` (np. wynik nieudanego scalenia
-  ## dwóch plików), które wcześniej były po cichu ignorowane poza
-  ## pierwszym wystąpieniem.
+  ## `release { }` w `zpk.build`.
   result = @[]
   for c in blk.children:
     if c.name == name: result.add c
