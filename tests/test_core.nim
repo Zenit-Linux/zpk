@@ -454,7 +454,7 @@ proc isolatedBinDir(scripts: openArray[tuple[name, content: string]]): string =
     let p = result / name
     writeFile(p, content)
     setFilePermissions(p, {fpUserExec, fpUserRead, fpUserWrite,
-                            fpGroupExec, fpGroupRead, fpOtherExec, fpOtherRead})
+                            fpGroupExec, fpGroupRead, fpOthersExec, fpOthersRead})
 
 suite "deps -- weryfikacja depends_on (best-effort)":
   test "zpm dostępne, zależność ZAINSTALOWANA -> dsInstalled":
@@ -565,7 +565,7 @@ proc copyRealGitInto(dir: string) =
   doAssert realGit.len > 0, "testy integracyjne release.nim wymagają 'git' w PATH"
   copyFile(realGit, dir / "git")
   setFilePermissions(dir / "git", {fpUserExec, fpUserRead, fpUserWrite,
-                                     fpGroupExec, fpGroupRead, fpOtherExec, fpOtherRead})
+                                     fpGroupExec, fpGroupRead, fpOthersExec, fpOthersRead})
 
 proc makeIsolatedGitPath(fakeGh: string = ""): string =
   ## Buduje katalog z PATH zawierającym WYŁĄCZNIE skopiowany binarny
@@ -586,7 +586,7 @@ proc makeIsolatedGitPath(fakeGh: string = ""): string =
     let ghPath = result / "gh"
     writeFile(ghPath, fakeGh)
     setFilePermissions(ghPath, {fpUserExec, fpUserRead, fpUserWrite,
-                                  fpGroupExec, fpGroupRead, fpOtherExec, fpOtherRead})
+                                  fpGroupExec, fpGroupRead, fpOthersExec, fpOthersRead})
 
 const fakeGhSuccessScript = """#!/bin/sh
 case "$1 $2" in
@@ -853,7 +853,7 @@ esac
     defer: removeDir(fakeBinDir)
     writeFile(fakeBinDir / "gh", fakeGh)
     setFilePermissions(fakeBinDir / "gh", {fpUserExec, fpUserRead, fpUserWrite,
-                                             fpGroupExec, fpGroupRead, fpOtherExec, fpOtherRead})
+                                             fpGroupExec, fpGroupRead, fpOthersExec, fpOthersRead})
     let originalPath = getEnv("PATH")
     putEnv("PATH", fakeBinDir & ":" & originalPath)
     defer: putEnv("PATH", originalPath)
