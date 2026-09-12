@@ -38,6 +38,21 @@ Albo pobierz binarkę bezpośrednio z
 linux-x86_64, linux-aarch64, linux-armv7 (pod emulacją QEMU w CI),
 macos-x86_64 i macos-aarch64.
 
+> **v0.3.2 -- konwencja nazywania assetów wydań.** `zpm` rozwiązuje
+> `{version}` we wpisie `zpk` w `own-repository.json` na dokładny TAG
+> release'a z GitHub Releases API (np. `v0.2`) i podstawia go DOSŁOWNIE
+> w oczekiwanej nazwie pliku (`zpk-{version}-x86_64.zpk`). Nazwa assetu
+> publikowanego przez `.github/workflows/build-zpk.yml` MUSI więc być
+> bajt-w-bajt tagiem release'a (`${{ github.ref_name }}`), NIE
+> przeliczoną/znormalizowaną wersją (np. bez prefiksu "v") -- rozjazd
+> między tymi dwoma powodował ciche 404 przy `zpm own install zpk` i
+> `status 'failed'` w bazie zpm (patrz `zpm doctor`). Workflow ma teraz
+> krok, który to sprawdza przed publikacją (fail-fast w CI).
+> **Uwaga:** obecny `build-zpk.yml` publikuje TYLKO linux-x86_64 -- opis
+> "dostępne dla ... aarch64, armv7, macos" wyżej wyprzedza rzeczywisty
+> stan CI i wymaga osobnej rozbudowy o macierz `matrix:` (patrz `ci.yml`,
+> który TAKĄ macierz już ma dla samych testów, ale nie dla publikacji).
+
 ## Szybki start
 
 ```
