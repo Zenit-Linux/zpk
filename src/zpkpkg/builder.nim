@@ -264,8 +264,25 @@ proc buildOneArch*(pkgDir: string, m: ZpkBuildManifest, arch: string, outDir: st
 
   createDir(outDir)
   let outPath = outDir / packageFileName(m.name, m.version, arch)
-  let tarCode = execCmd(&"tar --numeric-owner --owner=0 --group=0 -C {quoteShell(stageDir)} " &
-    &"-acf {quoteShell(outPath)} .")
+  # v0.3.2 -- NAPRAWA REALNEGO BUGA: bez `--transform` tar nazywa każdego
+  # członka archiwum z prefiksem "./" (bo pakujemy ".", nie listę nazw),
+  # czyli manifest ląduje w archiwum jako "./manifest.json". Ale
+  # `zpm`'s `extractManifestFromArchive` (używane przez `zpm verify`,
+  # `zpm install plik.zpk`, `zpm own install` dla .zpk) woła DOSŁOWNIE
+  # `tar -xOf plik.zpk manifest.json` -- BEZ prefiksu "./". Na GNU tar
+  # (przetestowane na 1.35) te dwie nazwy NIE są sobie równoważne --
+  # `tar -xOf` zwraca "Not found in archive", mimo że plik faktycznie
+  # jest w środku. Efekt: KAŻDY pakiet zbudowany tym kodem (przed tą
+  # poprawką) nie dawał się zainstalować przez `zpm`, mimo że sam
+  # `zpk build`/`zpk verify` (operujące na całym `tar -tf`/`-xf` bez
+  # podawania konkretnej nazwy członka) tego nie wykrywały -- stąd bug
+  # przechodził niezauważony aż do faktycznego `zpm install`.
+  # `--transform 's,^\./,,'` usuwa ten prefiks przy pakowaniu, więc
+  # członkowie archiwum nazywają się "manifest.json", "opt/...", itd.,
+  # dokładnie tak, jak `zpm` się tego spodziewa.
+  let tarCode = execCmd(&"tar --numeric-owner --owner=0 --group=0 " &
+    &"""--transform 's,^\./,,' """ &
+    &"-C {quoteShell(stageDir)} -acf {quoteShell(outPath)} .")
   if tarCode != 0:
     stderr.writeLine(&"[zpk] ✘ Pakowanie do {outPath} nie powiodło się (kod {tarCode}).")
     return (false, "", ZpkManifest())
