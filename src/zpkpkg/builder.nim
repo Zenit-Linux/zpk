@@ -2,6 +2,7 @@ import std/[os, osproc, json, strutils, strformat, times, tables, algorithm]
 import ./types
 import ./checksum
 import ./signing
+import ./archive
 
 ## Buduje `recipe.<lang>` w katalogu pakietu (ten sam kontrakt co
 ## `buildZpk` w zpm/src/zpmpkg/zpk.nim: recipe dostaje ZPM_PACKAGE_STAGE_DIR
@@ -219,6 +220,14 @@ proc buildOneArch*(pkgDir: string, m: ZpkBuildManifest, arch: string, outDir: st
     except ChecksumError as e:
       stderr.writeLine(&"[zpk] ✘ {e.msg}")
       return (false, "", ZpkManifest())
+  # v0.6 -- REPRODUKOWALNE BUDOWANIE: `walkDirRec` NIE gwarantuje stałej
+  # kolejności (zależy od systemu plików/OS -- ext4 vs tmpfs vs macOS
+  # potrafią zwracać wpisy katalogu w różnej kolejności). Bez sortowania
+  # `manifest.files` (a więc i bajty samego `manifest.json` w archiwum)
+  # mogłyby się różnić między dwoma buildami TEJ SAMEJ zawartości --
+  # sortujemy po ścieżce, żeby kolejność była deterministyczna niezależnie
+  # od systemu, na którym `zpk build` jest uruchamiane.
+  manifest.files.sort(proc(a, b: ZpkFileEntry): int = cmp(a.path, b.path))
 
   # v0.4 -- `manifest.sha256` NIE JEST już sumą CAŁEGO archiwum .zpk
   # (to byłoby niemożliwe do policzenia PRZED zapisaniem manifestu do
@@ -264,30 +273,35 @@ proc buildOneArch*(pkgDir: string, m: ZpkBuildManifest, arch: string, outDir: st
 
   createDir(outDir)
   let outPath = outDir / packageFileName(m.name, m.version, arch)
-  # v0.3.2 -- NAPRAWA REALNEGO BUGA: bez `--transform` tar nazywa każdego
-  # członka archiwum z prefiksem "./" (bo pakujemy ".", nie listę nazw),
-  # czyli manifest ląduje w archiwum jako "./manifest.json". Ale
-  # `zpm`'s `extractManifestFromArchive` (używane przez `zpm verify`,
-  # `zpm install plik.zpk`, `zpm own install` dla .zpk) woła DOSŁOWNIE
-  # `tar -xOf plik.zpk manifest.json` -- BEZ prefiksu "./". Na GNU tar
-  # (przetestowane na 1.35) te dwie nazwy NIE są sobie równoważne --
-  # `tar -xOf` zwraca "Not found in archive", mimo że plik faktycznie
-  # jest w środku. Efekt: KAŻDY pakiet zbudowany tym kodem (przed tą
-  # poprawką) nie dawał się zainstalować przez `zpm`, mimo że sam
-  # `zpk build`/`zpk verify` (operujące na całym `tar -tf`/`-xf` bez
-  # podawania konkretnej nazwy członka) tego nie wykrywały -- stąd bug
-  # przechodził niezauważony aż do faktycznego `zpm install`.
-  # `--transform 's,^\./,,'` usuwa ten prefiks przy pakowaniu, więc
-  # członkowie archiwum nazywają się "manifest.json", "opt/...", itd.,
-  # dokładnie tak, jak `zpm` się tego spodziewa.
-  let tarCode = execCmd(&"tar --numeric-owner --owner=0 --group=0 " &
-    &"""--transform 's,^\./,,' """ &
-    &"-C {quoteShell(stageDir)} -acf {quoteShell(outPath)} .")
-  if tarCode != 0:
-    stderr.writeLine(&"[zpk] ✘ Pakowanie do {outPath} nie powiodło się (kod {tarCode}).")
+  # v0.5 -- FORMAT ZPKA: pakowanie NIE odbywa się już przez `tar` (patrz
+  # `archive.nim` w tym samym katalogu dla pełnego opisu formatu i
+  # uzasadnienia). Poprzedni kod wołał `tar -acf plik.zpk .`; `-a`
+  # (auto-compress) rozpoznaje kompresję WYŁĄCZNIE po rozszerzeniu PLIKU
+  # WYJŚCIOWEGO (.gz/.xz/.zst...) -- ".zpk" nie jest rozpoznawane, więc
+  # KOMPRESJA NIGDY SIĘ NIE WŁĄCZAŁA i każdy dotychczasowy `.zpk` był w
+  # praktyce surowym tar-em (plus narzut 512-bajtowych bloków nagłówka
+  # na każdy plik). Nowy `archive.writeArchive` kompresuje każdy plik
+  # NIEZALEŻNIE (ZLZ1, czysty Nim) i zapisuje zwarty binarny TOC zamiast
+  # tar-owych nagłówków -- typowy pakiet wychodzi WYRAŹNIE mniejszy.
+  #
+  # Zbiera WSZYSTKIE pliki ze stagingu (w tym `manifest.json`, dopisany
+  # linijkę wyżej) -- `archive.writeArchive` sam sortuje wg ścieżki
+  # (buildy deterministyczne) i zwraca listę (ścieżka, sha256) w tej samej
+  # kolejności co WEJŚCIE, więc dla porządku podajemy tu wpisy z tego
+  # samego `stageDir`, który właśnie zbudowaliśmy.
+  var toPack: seq[archive.PendingFile] = @[]
+  for path in walkDirRec(stageDir):
+    let rel = path.relativePath(stageDir)
+    toPack.add archive.PendingFile(relPath: rel, absPath: path)
+  try:
+    discard archive.writeArchive(outPath, toPack)
+  except archive.ArchiveError as e:
+    stderr.writeLine(&"[zpk] ✘ Pakowanie do {outPath} nie powiodło się: {e.msg}")
     return (false, "", ZpkManifest())
 
-  echo &"[zpk] ✔ {outPath} (manifest.json w środku archiwum, sha256 zawartości={manifest.sha256})"
+  echo &"[zpk] ✔ {outPath} (format ZPKA v2, manifest.json w środku archiwum, " &
+    &"sha256 zawartości={manifest.sha256}, {toPack.len} plików, " &
+    &"{getFileSize(outPath)} B)"
   (true, outPath, manifest)
 
 proc buildAll*(pkgDir: string, m: ZpkBuildManifest, outDir: string,
@@ -305,15 +319,20 @@ proc buildAll*(pkgDir: string, m: ZpkBuildManifest, outDir: string,
   (true, built)
 
 proc extractManifestFromArchive(zpkPath: string): tuple[ok: bool, manifest: JsonNode, err: string] =
-  ## `manifest.json` mieszka TERAZ w środku archiwum (patrz `buildOneArch`),
-  ## nie obok niego -- wyciąga go przez `tar -xOf` (wypisuje zawartość
-  ## pojedynczego pliku archiwum na stdout, bez rozpakowywania reszty).
-  let (output, code) = execCmdEx(&"tar -xOf {quoteShell(zpkPath)} {quoteShell(ManifestFileName)}")
-  if code != 0 or output.strip().len == 0:
-    return (false, newJNull(), &"nie udało się odczytać '{ManifestFileName}' z wnętrza {zpkPath} " &
-      &"(kod {code}) -- czy to na pewno poprawne archiwum .zpk?")
+  ## `manifest.json` mieszka W ŚRODKU archiwum (patrz `buildOneArch`), nie
+  ## obok niego. v0.5 -- odczyt idzie przez `archive.extractMember`
+  ## (format ZPKA, patrz `archive.nim`): czyta stopkę + TOC i dekompresuje
+  ## WYŁĄCZNIE ten jeden człon, bez dotykania (a tym bardziej rozpakowania)
+  ## reszty archiwum na dysk -- szybsze i bez procesu potomnego względem
+  ## poprzedniego `tar -xOf`.
+  if not archive.isZpkaFile(zpkPath):
+    return (false, newJNull(), &"{zpkPath} nie jest archiwum w formacie ZPKA v2 -- to prawdopodobnie " &
+      "starszy pakiet .zpk budowany tar-em przez zpk < 0.5; przebuduj go bieżącym `zpk build`.")
+  let (ok, content, err) = archive.extractMember(zpkPath, ManifestFileName)
+  if not ok:
+    return (false, newJNull(), &"nie udało się odczytać '{ManifestFileName}' z wnętrza {zpkPath}: {err}")
   try:
-    (true, parseJson(output), "")
+    (true, parseJson(content), "")
   except CatchableError as e:
     (false, newJNull(), &"'{ManifestFileName}' wewnątrz {zpkPath} nie jest poprawnym JSON-em: {e.msg}")
 
@@ -343,31 +362,44 @@ proc verifyPackage*(zpkPath: string, publicKeyPath: string = ""): tuple[ok: bool
     for it in manifestJson["files"]:
       declaredFiles.add ZpkFileEntry(path: it{"path"}.getStr(""), sha256: it{"sha256"}.getStr(""))
 
-  let extractDir = getTempDir() / &"zpk-verify-{$epochTime().int}-{getCurrentProcessId()}"
-  createDir(extractDir)
-  defer: removeDir(extractDir)
-  let extractCode = execCmd(&"tar -C {quoteShell(extractDir)} -xf {quoteShell(zpkPath)}")
-  if extractCode != 0:
-    return (false, @[&"nie udało się rozpakować {zpkPath} do weryfikacji (kod {extractCode})"])
+  # v0.5 -- weryfikacja idzie DIREKT z archiwum (TOC + per-plik sha256
+  # zapisane w samym kontenerze ZPKA, patrz `archive.nim`), BEZ
+  # rozpakowywania niczego na dysk -- `archive.extractEntry` woła
+  # `verifyChecksum=true` domyślnie, więc suma jest sprawdzana od razu
+  # przy dekompresji każdego pliku (zamiast: rozpakuj CAŁE archiwum przez
+  # `tar -xf`, potem policz sha256 KAŻDEGO pliku ponownie z dysku).
+  var archiveIdx: archive.ArchiveIndex
+  try:
+    archiveIdx = archive.readIndex(zpkPath)
+  except archive.ArchiveError as e:
+    return (false, @[&"nie udało się odczytać TOC {zpkPath}: {e.msg}"])
 
   var recomputed: seq[ZpkFileEntry] = @[]
   var mismatch = false
   for entry in declaredFiles:
-    let full = extractDir / entry.path
-    if not fileExists(full):
+    let idx = archive.findEntry(archiveIdx, entry.path)
+    if idx < 0:
       ok = false
       mismatch = true
       messages.add &"BRAK pliku zadeklarowanego w manifeście: {entry.path}"
       continue
     try:
-      let actual = sha256sumOf(full)
+      discard archive.extractEntry(archiveIdx, archiveIdx.entries[idx], verifyChecksum = true)
+      # `extractEntry` już porównało sha256 z tym zapisanym w TOC archiwum
+      # (rzuciłoby `ArchiveError`, gdyby się nie zgadzało) -- teraz
+      # porównujemy TOC archiwum z tym, co deklaruje `manifest.json`
+      # (dwa NIEZALEŻNE miejsca w tym samym pliku -- TOC i manifest --
+      # muszą się zgadzać, inaczej ktoś zmodyfikował jedno bez drugiego).
+      let actual = archive.sha256HexOf(archiveIdx.entries[idx].sha256)
       recomputed.add ZpkFileEntry(path: entry.path, sha256: actual)
       if actual != entry.sha256:
         ok = false
         mismatch = true
         messages.add &"NIEZGODNOŚĆ sha256 pliku '{entry.path}': manifest={entry.sha256} obliczono={actual}"
-    except ChecksumError as e:
-      return (false, @[e.msg])
+    except archive.ArchiveError as e:
+      ok = false
+      mismatch = true
+      messages.add &"USZKODZONE dane pliku '{entry.path}' w archiwum: {e.msg}"
 
   if not mismatch:
     if declaredSha256.len == 0:
