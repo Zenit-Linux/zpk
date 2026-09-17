@@ -1,4 +1,4 @@
-import std/[os, parseopt, strutils, strformat]
+import std/[os, osproc, times, algorithm, parseopt, strutils, strformat]
 import ./zpkpkg/types
 import ./zpkpkg/manifest
 import ./zpkpkg/builder
@@ -6,8 +6,10 @@ import ./zpkpkg/release
 import ./zpkpkg/tutorial
 import ./zpkpkg/deps
 import ./zpkpkg/versionbump
+import ./zpkpkg/archive
+import ./zpkpkg/signing
 
-const zpkVersion = "0.2.0"
+const zpkVersion = "0.3.0"
 
 proc usage() =
   echo &"""
@@ -23,6 +25,11 @@ Użycie:
   zpk validate                            Sprawdza zpk.build bez budowania
   zpk deps                                Sprawdza status package.depends_on (best-effort)
   zpk verify <plik.zpk> [--pubkey=]       Sprawdza integralność/autentyczność pakietu
+  zpk inspect <plik.zpk>                  Podgląd zawartości archiwum (rozmiary/kompresja), bez instalacji
+  zpk diff <stary.zpk> <nowy.zpk>         Różnice między wersjami pakietu (z samego TOC, bez rozpakowania)
+  zpk delta <stary.zpk> <nowy.zpk> <out>  Buduje mały plik delty (.zpkd) do aktualizacji bez pełnego pobierania
+  zpk migrate <stary.zpk> <nowy.zpk>      Przepakowuje pre-v0.5 (tar) .zpk do formatu ZPKA v2 (wymaga `tar`)
+  zpk genkey <prefiks>                    Generuje parę kluczy Ed25519 (czysty Nim, bez openssl)
   zpk version | --version | -v
   zpk help | --help | -h
 
@@ -58,16 +65,27 @@ Flagi `zpk schedule-release`:
   --verbose
 
 Flagi `zpk verify`:
-  --pubkey=<ścieżka>     Klucz publiczny PEM do weryfikacji podpisu (domyślnie:
-                         zmienna środowiskowa ZPK_VERIFY_KEY)
+  --pubkey=<ścieżka>     Klucz publiczny (natywny Ed25519 albo PEM) do weryfikacji
+                         podpisu (domyślnie: zmienna środowiskowa ZPK_VERIFY_KEY)
+
+Reprodukowalne buildy:
+  SOURCE_DATE_EPOCH=<unix-timestamp> zpk build
+                         Znacznik czasu w manifeście pochodzi z tej zmiennej zamiast
+                         zegara -- dwa buildy tej samej zawartości z tym samym
+                         SOURCE_DATE_EPOCH dają bajt-w-bajt identyczny .zpk.
 
 Przykłady:
   zpk init && zpk build --verbose
   zpk build --release --verbose
   zpk bump-version minor
   zpk bump-version --set=2.0.0
-  ZPK_SIGN_KEY=~/.zpk/signing-key.pem zpk build --release
+  zpk genkey ~/.zpk/signing-key
+  ZPK_SIGN_KEY=~/.zpk/signing-key.priv zpk build --release
   zpk verify out/hello-world-1.0.0-x86_64.zpk --pubkey=~/.zpk/signing-key.pub
+  zpk inspect out/hello-world-1.0.0-x86_64.zpk
+  zpk diff old/hello-world-1.0.0-x86_64.zpk out/hello-world-1.1.0-x86_64.zpk
+  zpk delta old/hello-world-1.0.0-x86_64.zpk out/hello-world-1.1.0-x86_64.zpk update.zpkd
+  zpk migrate legacy-package.zpk legacy-package-migrated.zpk
   zpk deps
   zpk schedule-release --branch=testing
   zpk schedule-release --asset=out/x-1.0.0-x86_64.zpk --asset=out/x-1.0.0-aarch64.zpk
@@ -260,6 +278,152 @@ proc cmdVerify(zpkPath, pubKey: string) =
     stderr.writeLine(&"[zpk] ✘ weryfikacja {zpkPath} nie powiodła się.")
     quit(1)
 
+proc humanSize(n: uint64): string =
+  if n < 1024: return $n & " B"
+  if n < 1024*1024: return &"{n.float / 1024.0:.1f} KiB"
+  if n < 1024*1024*1024: return &"{n.float / (1024.0*1024.0):.1f} MiB"
+  &"{n.float / (1024.0*1024.0*1024.0):.1f} GiB"
+
+proc cmdInspect(zpkPath: string) =
+  ## `zpk inspect` -- podgląd zawartości archiwum BEZ instalacji: lista
+  ## plików, rozmiary surowe/skompresowane, metoda kompresji, łączny
+  ## współczynnik. Czyta WYŁĄCZNIE TOC (stopka archiwum), nie dotyka
+  ## ładunku -- błyskawiczne nawet dla wielkich pakietów.
+  if not archive.isZpkaFile(zpkPath):
+    stderr.writeLine(&"[zpk] ✘ {zpkPath} nie jest archiwum w formacie ZPKA v2.")
+    quit(1)
+  let (ok, report, err) = archive.inspectArchive(zpkPath)
+  if not ok:
+    stderr.writeLine(&"[zpk] ✘ {err}")
+    quit(1)
+  echo &"[zpk] {zpkPath}  ({report.entries.len} plików)"
+  echo ""
+  var sorted = report.entries
+  sorted.sort(proc(a, b: archive.InspectEntry): int = cmp(b.rawSize, a.rawSize))
+  echo &"  {\"METODA\":<7} {\"SUROWO\":>10} {\"SKOMPR.\":>10} {\"WSP.\":>6}  ŚCIEŻKA"
+  for e in sorted:
+    let ratio = if e.rawSize > 0: (e.compSize.float / e.rawSize.float) * 100.0 else: 0.0
+    echo &"  {e.methodName:<7} {humanSize(e.rawSize):>10} {humanSize(e.compSize):>10} {ratio:>5.1f}%  {e.path}"
+  echo ""
+  let totalRatio = if report.totalRaw > 0: (report.totalComp.float / report.totalRaw.float) * 100.0 else: 0.0
+  echo &"  RAZEM: {humanSize(report.totalRaw)} -> {humanSize(report.totalComp)} ({totalRatio:.1f}%, archiwum na dysku: {humanSize(uint64(getFileSize(zpkPath)))})"
+
+proc cmdDiff(pathA, pathB: string) =
+  ## `zpk diff` -- różnice między dwiema wersjami pakietu, WYŁĄCZNIE z
+  ## TOC obu archiwów (ścieżka + sha256 + rozmiar) -- bez rozpakowania
+  ## jednego bajtu ładunku którejkolwiek strony.
+  for p in [pathA, pathB]:
+    if not archive.isZpkaFile(p):
+      stderr.writeLine(&"[zpk] ✘ {p} nie jest archiwum w formacie ZPKA v2.")
+      quit(1)
+  let (ok, report, err) = archive.diffArchives(pathA, pathB)
+  if not ok:
+    stderr.writeLine(&"[zpk] ✘ {err}")
+    quit(1)
+  echo &"[zpk] diff {pathA} -> {pathB}"
+  var added, removed, changed = 0
+  for e in report.entries:
+    case e.kind
+    of dkAdded:
+      inc added
+      echo &"  + {e.path}  ({humanSize(e.newSize)})"
+    of dkRemoved:
+      inc removed
+      echo &"  - {e.path}  ({humanSize(e.oldSize)})"
+    of dkChanged:
+      inc changed
+      echo &"  ~ {e.path}  ({humanSize(e.oldSize)} -> {humanSize(e.newSize)})"
+    of dkUnchanged:
+      discard
+  echo ""
+  echo &"[zpk] {added} dodanych, {removed} usuniętych, {changed} zmienionych, " &
+    &"{report.unchangedCount} bez zmian."
+
+proc cmdDelta(oldPath, newPath, outPath: string) =
+  ## `zpk delta` -- buduje mały plik delty (`.zpkd`) pozwalający
+  ## odtworzyć `newPath` mając `oldPath` + deltę, bez przesyłania całego
+  ## nowego archiwum -- pliki niezmienione (ta sama treść, wg sha256) są
+  ## w delcie tylko ODNIESIENIEM do starego archiwum.
+  for p in [oldPath, newPath]:
+    if not archive.isZpkaFile(p):
+      stderr.writeLine(&"[zpk] ✘ {p} nie jest archiwum w formacie ZPKA v2.")
+      quit(1)
+  let (ok, msg) = archive.buildDelta(oldPath, newPath, outPath)
+  if not ok:
+    stderr.writeLine(&"[zpk] ✘ {msg}")
+    quit(1)
+  let deltaSize = getFileSize(outPath)
+  let newSize = getFileSize(newPath)
+  echo &"[zpk] ✔ {outPath} ({humanSize(uint64(deltaSize))}, {msg})"
+  echo &"[zpk]   dla porównania: pełne {newPath} to {humanSize(uint64(newSize))}"
+
+proc cmdMigrate(oldZpkPath, outPath: string) =
+  ## `zpk migrate` -- jednorazowe, OPT-IN przepakowanie starszego `.zpk`
+  ## (tar, sprzed v0.5) do nowego formatu ZPKA v2, BEZ potrzeby
+  ## przebudowywania pakietu od zera z jego oryginalnego recipe (które
+  ## może już nie być pod ręką -- stary tarball to jedyne, co zostało).
+  ##
+  ## To JEDYNE miejsce w całym `zpk`/`zpm`, które nadal (opcjonalnie,
+  ## tylko na wyraźne żądanie) korzysta z systemowego `tar` -- bo to
+  ## JEDYNY sposób odczytania STAREGO formatu, którego `archive.nim`
+  ## świadomie nie obsługuje (patrz uzasadnienie w `archive.nim`).
+  ## Wymaga `tar` w PATH; jeśli go brak, kończy się jasnym błędem.
+  if archive.isZpkaFile(oldZpkPath):
+    echo &"[zpk] {oldZpkPath} jest JUŻ w formacie ZPKA v2 -- migracja niepotrzebna."
+    return
+  if findExe("tar").len == 0:
+    stderr.writeLine("[zpk] ✘ `zpk migrate` potrzebuje systemowego `tar` do odczytania " &
+      "STAREGO formatu (jedyne miejsce w zpk, które go używa) -- nie znaleziono w PATH.")
+    quit(1)
+
+  let tmpDir = getTempDir() / &"zpk-migrate-{$epochTime().int}-{getCurrentProcessId()}"
+  createDir(tmpDir)
+  defer: removeDir(tmpDir)
+  echo &"[zpk] Rozpakowuję (tar) {oldZpkPath} do przepakowania..."
+  let code = execCmd(&"tar -C {quoteShell(tmpDir)} -xf {quoteShell(oldZpkPath)}")
+  if code != 0:
+    stderr.writeLine(&"[zpk] ✘ `tar -xf {oldZpkPath}` nie powiodło się (kod {code}) -- " &
+      "plik uszkodzony albo to nie jest archiwum tar.")
+    quit(1)
+
+  let oldManifestPath = tmpDir / ManifestFileName
+  if not fileExists(oldManifestPath):
+    stderr.writeLine(&"[zpk] ✘ {oldZpkPath} nie zawiera {ManifestFileName} -- to nie wygląda na pakiet .zpk.")
+    quit(1)
+
+  var toPack: seq[archive.PendingFile] = @[]
+  for path in walkDirRec(tmpDir):
+    let rel = path.relativePath(tmpDir)
+    toPack.add archive.PendingFile(relPath: rel, absPath: path)
+
+  # Manifest jest przepakowywany TAKI, JAKI BYŁ (w tym stary podpis, jeśli
+  # istniał -- treść plików się nie zmienia, więc sha256 per plik i
+  # agregat w manifeście POZOSTAJĄ poprawne; zmienia się WYŁĄCZNIE
+  # kontener na dysku, nie to, co on poświadcza).
+  discard archive.writeArchive(outPath, toPack)
+  echo &"[zpk] ✔ {outPath} -- przepakowano do formatu ZPKA v2 " &
+    &"({humanSize(uint64(getFileSize(oldZpkPath)))} -> {humanSize(uint64(getFileSize(outPath)))})"
+  echo "[zpk]   Uwaga: manifest (w tym sha256/podpis, jeśli był) przeniesiony bez zmian --" &
+    " poświadcza tę samą zawartość, tylko w nowym kontenerze."
+
+proc cmdGenkey(outPrefix: string) =
+  ## `zpk genkey` -- generuje nową parę kluczy Ed25519 W 100% W NIM
+  ## (`ed25519.nim`, ziarno z `std/sysrand` -- bezpieczny generator
+  ## systemowy), ZERO zależności od `openssl`. Zapisuje
+  ## `<prefix>.priv`/`<prefix>.pub` w natywnym formacie tekstowym.
+  let privPath = outPrefix & ".priv"
+  let pubPath = outPrefix & ".pub"
+  if fileExists(privPath) or fileExists(pubPath):
+    stderr.writeLine(&"[zpk] ✘ {privPath} lub {pubPath} już istnieje -- nie nadpisuję. " &
+      "Podaj inny prefiks albo usuń istniejące pliki ręcznie.")
+    quit(1)
+  signing.genNativeEd25519Keypair(privPath, pubPath)
+  echo &"[zpk] ✔ Wygenerowano parę kluczy Ed25519 (czysty Nim, bez openssl):"
+  echo &"[zpk]     prywatny: {privPath}  (trzymaj w sekrecie, chmod 600 ustawiony automatycznie)"
+  echo &"[zpk]     publiczny: {pubPath}  (rozpowszechniaj -- służy do `zpk verify --pubkey=`/`zpm`)"
+  echo &"[zpk]   Użycie przy budowaniu:  ZPK_SIGN_KEY={privPath} zpk build"
+  echo &"[zpk]   Użycie przy weryfikacji: zpk verify plik.zpk --pubkey={pubPath}"
+
 proc cmdScheduleRelease(buildFile, branchOverride: string, assetOverrides: seq[string],
                          verbose, dryRun, skipUpload: bool) =
   var m: ZpkBuildManifest
@@ -364,6 +528,31 @@ proc main() =
       stderr.writeLine("[zpk] ✘ zpk verify wymaga ścieżki do pliku .zpk")
       quit(1)
     cmdVerify(positional[1], pubKeyOpt)
+  of "inspect":
+    if positional.len < 2:
+      stderr.writeLine("[zpk] ✘ zpk inspect wymaga ścieżki do pliku .zpk")
+      quit(1)
+    cmdInspect(positional[1])
+  of "diff":
+    if positional.len < 3:
+      stderr.writeLine("[zpk] ✘ zpk diff wymaga dwóch ścieżek: <stary.zpk> <nowy.zpk>")
+      quit(1)
+    cmdDiff(positional[1], positional[2])
+  of "delta":
+    if positional.len < 4:
+      stderr.writeLine("[zpk] ✘ zpk delta wymaga trzech ścieżek: <stary.zpk> <nowy.zpk> <out.zpkd>")
+      quit(1)
+    cmdDelta(positional[1], positional[2], positional[3])
+  of "migrate":
+    if positional.len < 3:
+      stderr.writeLine("[zpk] ✘ zpk migrate wymaga dwóch ścieżek: <stary.zpk> <nowy.zpk>")
+      quit(1)
+    cmdMigrate(positional[1], positional[2])
+  of "genkey":
+    if positional.len < 2:
+      stderr.writeLine("[zpk] ✘ zpk genkey wymaga prefiksu ścieżki (np. `zpk genkey ~/.zpk/signing-key`)")
+      quit(1)
+    cmdGenkey(positional[1])
   of "schedule-release":
     cmdScheduleRelease(fileOpt, branchOpt, assetOpts, verbose, dryRun, skipUpload)
   of "tutorial-release":
