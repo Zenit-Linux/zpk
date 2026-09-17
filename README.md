@@ -16,13 +16,22 @@ dostępne jako pakiet `.zpk` (patrz katalog [`packaging/`](packaging/)).
 * [`gh`](https://cli.github.com/) (GitHub CLI), zalogowane (`gh auth
   login`) -- opcjonalnie, do automatycznego tworzenia PR-ów i
   GitHub Releases; bez niego `zpk` podaje instrukcję ręcznego dokończenia.
-* Do liczenia sha256: `sha256sum`, `shasum` (macOS) albo `openssl` --
-  `zpk` próbuje po kolei, którekolwiek jest w PATH (patrz "Przenośność").
 * Do podpisywania/weryfikacji pakietów: `openssl` >= 3.0 (opcjonalnie --
-  wymagane dla Ed25519, patrz "Bezpieczeństwo" niżej).
+  wymagane dla Ed25519, patrz "Bezpieczeństwo" niżej). To JEDYNE miejsce,
+  w którym `zpk` w ogóle odpala proces potomny do czegoś związanego z
+  samym pakietem -- **budowanie, pakowanie i liczenie sum kontrolnych nie
+  wymaga już niczego zewnętrznego, patrz "Format `.zpk` -- ZPKA v2" niżej.**
 * Do weryfikacji `depends_on`: `zpm` w PATH (opcjonalnie, patrz `zpk deps`).
 * Interpreter wskazany w `recipe.lang` (domyślnie `janet`) -- musi być
-  w PATH przy `zpk build`.
+  w PATH przy `zpk build` (to uruchamia SKRYPT BUDUJĄCY danego pakietu,
+  nie samo `zpk` -- odrębna sprawa od pakowania wyniku do `.zpk`).
+
+> **v0.5 -- zero zależności od `tar`/`sha256sum`/`shasum`.** Wcześniej
+> `zpk` wymagało `tar` w PATH do pakowania/rozpakowywania i próbowało po
+> kolei `sha256sum`/`shasum`/`openssl` do liczenia sum kontrolnych. Od
+> v0.5 archiwizacja (nowy format ZPKA) i sha256 są w 100% wkompilowane w
+> binarkę `zpk` -- działa identycznie na KAŻDEJ platformie z gotową
+> binarką, nawet bez coreutils. Patrz sekcja niżej.
 
 ## Instalacja
 
@@ -200,6 +209,91 @@ zpk bump-version --set=2.0.0  # ustaw jawnie
 Podmienia WYŁĄCZNIE wartość `version` w `zpk.build`, zachowując
 komentarze i formatowanie reszty pliku bez zmian.
 
+## Format `.zpk` -- ZPKA v2 (natywny, zero zależności zewnętrznych)
+
+Od v0.5 `zpk build` NIE odpala już `tar` (ani żadnego innego procesu
+potomnego) do zapakowania pakietu -- cały mechanizm archiwizacji jest
+własnym, w 100% czysto-Nimowym formatem kontenera, wkompilowanym w
+binarkę `zpk`/`zpm` (`src/zpkpkg/archive.nim` + `zlz.nim` + `zsha256.nim`,
+identyczny kod po obu stronach -- patrz też `zpm`). Zero linkowania z
+`libz`/`liblzma`/`libzstd`, zero odpalania `gzip`/`xz`/`zstd`/`sha256sum`.
+
+### Dlaczego to realna, a nie kosmetyczna zmiana
+
+Poprzedni kod budował archiwum przez `tar --numeric-owner ... -acf
+plik.zpk .`. Flaga `-a` (auto-compress) GNU tar rozpoznaje, czy
+kompresować, WYŁĄCZNIE po rozszerzeniu pliku wyjściowego (`.gz`, `.xz`,
+`.zst`...) -- `.zpk` nie jest na tej liście, więc **kompresja nigdy się
+nie włączała**. Każdy dotychczasowy `.zpk` był w praktyce surowym,
+NIESKOMPRESOWANYM archiwum tar (plus narzut 512-bajtowych bloków
+nagłówkowych na każdy plik i wyrównania do granicy bloku) -- zmieniony
+tylko z rozszerzenia. Nowy format ZPKA:
+
+* **Kompresuje każdy plik niezależnie** (`ZLZ1` -- własny, prosty LZ77 z
+  tabelą hashy i tokenami o zmiennej długości, patrz komentarz w
+  `zlz.nim`) -- jeśli kompresja by powiększyła dany plik (np. już
+  skompresowane obrazki/binarki), zapisywany jest surowo, więc archiwum
+  NIGDY nie jest gorsze niż suma rozmiarów plików, tylko lepiej. Na
+  typowych zestawach (kod źródłowy, configi, binarki ELF) daje realną,
+  wyraźną redukcję rozmiaru -- bez najmniejszego narzutu boilerplate'u,
+  jaki miał tar (nagłówki 512 B/plik, wyrównanie bloków).
+* **Nie ma bloków wyrównania ani nagłówków tar** -- zwarty binarny spis
+  treści (TOC) zamiast tekstowych nagłówków `ustar` na każdy plik.
+* **Daje dostęp O(1) do pojedynczego pliku** (np. `manifest.json`) --
+  TOC leży w stopce archiwum (jak EOCD w ZIP), więc odczyt jednego pliku
+  NIE wymaga skanowania/rozpakowania reszty, w przeciwieństwie do `tar
+  -xOf`, które i tak przechodzi przez strumień archiwum.
+* **Selektywna, allowlistowa instalacja bez podprocesu** -- `zpm`
+  rozpakowuje WYŁĄCZNIE pliki wymienione w `manifest.files` bezpośrednio
+  z TOC (`archive.extractSelected`), bez `tar -xf ... -- p1 p2 ...`.
+* **Każdy wpis TOC niesie własne sha256** (liczone przy budowaniu),
+  sprawdzane automatycznie przy KAŻDEJ dekompresji -- uszkodzenie
+  pojedynczego pliku jest wykrywane natychmiast, nie dopiero po pełnym
+  rozpakowaniu całości.
+
+### Format na dysku (skrót, pełny opis w `src/zpkpkg/archive.nim`)
+
+```
+"ZPKA" + wersja(1B) + flagi(1B)              <- nagłówek (6 B)
+<blok danych pliku 1> <blok danych pliku 2> ...  <- ładunek, skompresowany per-plik
+<TOC: ścieżka, flagi, offset, rozmiary, sha256[32]>  <- posortowane wg ścieżki
+"ZEND" + liczbaWpisów(4B) + offsetTOC(8B)    <- stopka (16 B, czytana od końca pliku)
+```
+
+`zpk verify`/`zpm verify`/`zpm install` odczytują NAJPIERW stopkę (ostatnie
+16 bajtów pliku), potem TOC -- rozpoznanie formatu i lista plików nie
+wymaga wczytania ładunku. Wykrywanie: `isZpkaFile` sprawdza magic `ZPKA`
+na początku pliku.
+
+### v0.6 -- lepsza kompresja (ZLZ2) i strumieniowanie dużych plików
+
+Oprócz ZLZ1 (LZ77 bez etapu entropijnego, opisany wyżej) `archive.nim`
+umie też **ZLZ2** -- LZ77 + kanoniczne kodowanie Huffmana (jak DEFLATE),
+blokami po 1 MiB (`zlz2.nim`, też czysty Nim). Dla każdego pliku
+<= 4 MiB `zpk build` próbuje surowo/ZLZ1/ZLZ2 i wybiera najmniejszy
+wynik -- ZLZ2 zwykle daje dodatkowe 10-30% redukcji względem ZLZ1 na
+danych tekstowych/binarnych (patrz `tests/test_v06_features.nim`).
+
+Dla plików WIĘKSZYCH niż 4 MiB `zpk build` przechodzi na tryb
+**strumieniowy**: czyta i kompresuje plik blokami bezpośrednio z dysku,
+bez wczytywania całości do pamięci naraz -- ważne przy pakietach z
+wielogigabajtowymi binarkami/danymi, gdzie poprzednie podejście
+(`readFile` całego pliku) mogłoby wyczerpać pamięć. Rozpakowywanie
+takich wpisów (`zpm install`) jest tak samo strumieniowe -- pisze każdy
+zdekompresowany blok wprost do pliku docelowego, z bieżąco liczoną sumą
+sha256, zamiast budować całą zawartość w pamięci przed zapisem.
+
+### Zgodność wsteczna -- pakiety trzeba przebudować
+
+To ZMIANA ŁAMIĄCA format binarny: pakiety `.zpk` zbudowane przez `zpk <
+0.5` (surowy tar) NIE są czytelne przez `zpk >= 0.5`/`zpm >= 0.5` --
+`zpk verify`/`zpm install` zwrócą jasny komunikat "to prawdopodobnie
+starszy pakiet .zpk budowany tar-em... przebuduj go bieżącym `zpk
+build`", zamiast mylącego błędu parsowania. Repozytoria (`own-repository`
+i natywny indeks `zpm`) wymagają przebudowania i ponownej publikacji
+wszystkich pakietów `.zpk` po aktualizacji do v0.5 -- jednorazowy koszt
+w zamian za pełną niezależność od narzędzi zewnętrznych i mniejsze pliki.
+
 ## Bezpieczeństwo: integralność i (opcjonalnie) autentyczność
 
 **Manifest (`manifest.json`) leży W ŚRODKU każdego archiwum `.zpk`, NIE
@@ -222,42 +316,154 @@ zawartość do katalogu tymczasowego i przelicza obie sumy od nowa. To
 chroni przed uszkodzeniem/przypadkową zmianą, ale **NIE** dowodzi, kto
 zbudował pakiet.
 
-Dla autentyczności `zpk` opcjonalnie **podpisuje kryptograficznie**
-(przez `openssl`, klucz RSA lub Ed25519 w PEM) -- sterowane zmienną
-`ZPK_SIGN_KEY` (albo `zpk build --sign-key=<ścieżka>`):
+Dla autentyczności `zpk` opcjonalnie **podpisuje kryptograficznie** --
+sterowane zmienną `ZPK_SIGN_KEY` (albo `zpk build --sign-key=<ścieżka>`).
+Od v0.6 są DWIE drogi:
+
+**1. Natywny Ed25519 (zalecane, zero zależności od `openssl`):**
+
+```
+zpk genkey ~/.zpk/signing-key          # tworzy signing-key.priv/.pub, czysty Nim
+ZPK_SIGN_KEY=~/.zpk/signing-key.priv zpk build --release
+zpk verify out/hello-world-1.0.0-x86_64.zpk --pubkey=~/.zpk/signing-key.pub
+```
+
+`zpk genkey` generuje parę kluczy Ed25519 w 100% w Nim (`ed25519.nim` --
+własna implementacja RFC 8032: SHA-512 + arytmetyka mod 2^255-19 +
+skręcona krzywa Edwardsa, bez linkowania z `libcrypto`/`libsodium`),
+ziarno z `std/sysrand` (bezpieczny generator systemowy: `getrandom` na
+Linuksie, `arc4random` na macOS/BSD, `CryptGenRandom` na Windows -- NIE
+`std/random`). Klucze zapisywane jako czytelny tekst z nagłówkiem
+`-----BEGIN ZPK NATIVE ED25519 ...-----` (jawnie odróżnialny od PEM).
+Zweryfikowane end-to-end wobec niezależnej biblioteki `cryptography`/
+OpenSSL (wygenerowane podpisy bit-w-bit identyczne z referencją na 15
+wektorach, w tym wiadomości do 5000 bajtów -- patrz
+`tests/test_v06_features.nim`).
+
+> **Uwaga o dojrzałości:** to własna implementacja prymitywu
+> kryptograficznego, poprawna funkcjonalnie (patrz testy), ale bez
+> profesjonalnego audytu bezpieczeństwa i BEZ odporności na ataki przez
+> kanał boczny (czas wykonania zależy od klucza). Dla modelu zagrożeń
+> `zpk`/`zpm` (podpis integralności weryfikowany lokalnie, klucz nigdy
+> nie opuszcza maszyny budującej) ryzyko jest niskie, ale to nie jest
+> zamiennik dla zastosowań o wysokiej stawce bezpieczeństwa -- tam nadal
+> lepszy jest sprawdzony `openssl`/`libsodium` (droga 2. niżej).
+
+**2. PEM przez `openssl` (RSA/EC/Ed25519, zgodność wsteczna):**
 
 ```
 ZPK_SIGN_KEY=~/.zpk/signing-key.pem zpk build --release
 ```
 
+`zpk` wykrywa typ klucza automatycznie -- RSA/EC przez `openssl dgst
+-sign` (streaming digest), Ed25519-PEM przez `openssl pkeyutl -sign
+-rawin` (wymaga OpenSSL >= 3.0). Zachowane dla kogoś, kto już ma
+klucz/łańcuch zaufania z tej strony (np. firmowy HSM/CA).
+
 Podpis (base64) ląduje w polu `manifest.signature` -- w środku
-archiwum, tak jak reszta manifestu, NIE w osobnym `out/<pakiet>.zpk.sig`
-jak wcześniej. Weryfikacja:
-
-```
-zpk verify out/hello-world-1.0.0-x86_64.zpk --pubkey=~/.zpk/signing-key.pub
-```
-
-**RSA vs Ed25519:** `zpk` wykrywa typ klucza automatycznie i używa
-właściwej komendy openssl -- RSA/EC przez `openssl dgst -sign`
-(streaming digest), Ed25519 przez `openssl pkeyutl -sign -rawin`
-(Ed25519 podpisuje całą wiadomość, nie zewnętrznie liczony skrót;
-`dgst -sign` kończy się dla niego błędem "Key type not supported").
-Wymaga OpenSSL >= 3.0 dla flagi `-rawin`. Obie ścieżki mają testy
-end-to-end z prawdziwymi kluczami generowanymi w czasie testu (patrz
-`tests/test_core.nim`, sekcja "signing").
+archiwum, niezależnie od tego, którą z dwóch dróg powstał; `zpk
+verify`/`zpm verify` rozpoznają format klucza automatycznie po
+pierwszej linii pliku i nie wymagają, żeby użytkownik wiedział, której
+drogi użyto.
 
 Bez `ZPK_SIGN_KEY`/`--sign-key` zachowanie jest identyczne jak wcześniej
 (tylko sha256, bez podpisu) -- podpisywanie jest w pełni opcjonalne i
-`zpk` **nigdy** samo nie generuje ani nie przechowuje kluczy.
+`zpk` **nigdy** samo nie generuje ani nie przechowuje kluczy poza
+wyraźnym `zpk genkey`.
+
+## Reprodukowalne buildy (`SOURCE_DATE_EPOCH`)
+
+Archiwum ZPKA samo w sobie NIE niesie żadnych metadanych systemowych
+(mtime/uid/gid/uprawnienia) -- w przeciwieństwie do `tar`, więc ten
+źródłowy szum nie istnieje od początku. Jedynym źródłem niedeterminizmu
+był znacznik czasu budowania (`manifest.built_at`, domyślnie "teraz").
+Ustawienie `SOURCE_DATE_EPOCH` (konwencja z reproducible-builds.org,
+używana też przez Debiana) na stały unix-timestamp sprawia, że DWA
+buildy tej samej zawartości (to samo `zpk.build`+recipe, ten sam
+`SOURCE_DATE_EPOCH`, ten sam klucz podpisujący) dają **bajt-w-bajt
+identyczny** plik `.zpk` -- w tym identyczny podpis (Ed25519/EdDSA jest
+deterministyczne z definicji: ten sam klucz+wiadomość zawsze dają ten
+sam podpis, bez losowego nonce jak w RSA-PSS/ECDSA):
+
+```
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) zpk build --release
+```
+
+`manifest.files` jest też jawnie sortowane po ścieżce (niezależnie od
+kolejności zwracanej przez system plików, która nie jest gwarantowana)
+-- patrz `tests/test_v06_features.nim` dla testu porównującego dwa
+niezależne buildy tego samego pakietu bajt po bajcie.
+
+## `zpk inspect` -- podgląd zawartości pakietu bez instalacji
+
+```
+zpk inspect out/hello-world-1.0.0-x86_64.zpk
+```
+
+Wypisuje każdy plik w archiwum z rozmiarem surowym/skompresowanym,
+metodą kompresji (surowo/ZLZ1/ZLZ2) i współczynnikiem, plus podsumowanie
+całego pakietu. Czyta WYŁĄCZNIE spis treści (TOC) w stopce archiwum --
+nie rozpakowuje ani nie dotyka ładunku, więc działa błyskawicznie
+niezależnie od rozmiaru pakietu.
+
+## `zpk diff` -- różnice między dwiema wersjami pakietu
+
+```
+zpk diff old/hello-world-1.0.0-x86_64.zpk out/hello-world-1.1.0-x86_64.zpk
+```
+
+Porównuje TOC obu archiwów (ścieżka + sha256 + rozmiar) i wypisuje
+dodane/usunięte/zmienione pliki -- też bez rozpakowania jednego bajtu
+ładunku którejkolwiek strony. Przydatne w CI do szybkiego przeglądu "co
+się zmieniło w tym release'ie" bez ręcznego rozpakowywania dwóch
+archiwów.
+
+## `zpk delta` -- małe aktualizacje zamiast pełnego pobierania
+
+```
+zpk delta old/hello-world-1.0.0-x86_64.zpk out/hello-world-1.1.0-x86_64.zpk update.zpkd
+```
+
+Buduje plik delty (`.zpkd`) zawierający TYLKO payload plików, których
+zawartość (sha256) różni się od starej wersji -- pliki niezmienione są w
+delcie jedynie ODNIESIENIEM ("weź to z old.zpk"), dopasowanym po TREŚCI,
+nie po ścieżce (przeniesiony/przemianowany, ale identyczny plik nadal
+korzysta z reużycia). W typowej aktualizacji patch-level delta bywa
+rzędu kilku-kilkunastu procent rozmiaru pełnego archiwum (patrz test w
+`tests/test_v06_features.nim`, gdzie delta to ~8% pełnego pakietu przy
+zmianie 3 z 5 plików). Po stronie instalującej: `zpm apply-delta
+old.zpk update.zpkd new.zpk` odtwarza pełne archiwum -- bajt-w-bajt
+identyczne z tym, co dałoby pobranie `new.zpk` w całości -- kopiując
+niezmienione bloki wprost ze starego archiwum, bez ponownej kompresji.
+
+## `zpk migrate` -- przepakowanie starych pakietów (opt-in, jedyne użycie `tar`)
+
+```
+zpk migrate legacy-package.zpk legacy-package-migrated.zpk
+```
+
+Pakiety `.zpk` zbudowane przez `zpk < 0.5` (surowy tar, patrz sekcja
+"Format .zpk" niżej) NIE są czytelne przez `zpk >= 0.5`/`zpm >= 0.5`.
+Zamiast wymagać przebudowania od zera z oryginalnego recipe (które może
+już nie być pod ręką), `zpk migrate` rozpakowuje stary tarball i pakuje
+go od nowa do formatu ZPKA v2 -- manifest (w tym sha256/podpis, jeśli
+pakiet był podpisany) jest przenoszony BEZ ZMIAN, bo dotyczy treści
+plików, nie kontenera. To JEDYNE miejsce w całym `zpk`/`zpm`, które
+nadal (świadomie, tylko na wyraźne żądanie) korzysta z systemowego
+`tar` -- bo to jedyny sposób odczytania formatu, którego `archive.nim`
+celowo nie obsługuje. Jeśli `tar` nie jest dostępny w PATH, komenda
+kończy się jasnym błędem zamiast ukrytego fallbacku.
 
 ## Przenośność: liczenie sha256
 
-Zamiast twardej zależności wyłącznie od `sha256sum` (coreutils, nie ma
-go domyślnie na macOS), `zpk` próbuje po kolei: `sha256sum` →
-`shasum -a 256` → `openssl dgst -sha256` -- używa pierwszego, które
-faktycznie znajdzie w PATH. Jeśli żadne nie jest dostępne, `zpk build`
-kończy się jasnym błędem zamiast cichego pustego sha256 w manifeście.
+Od v0.5 sha256 liczy WŁASNA implementacja w czystym Nim (`zsha256.nim`,
+FIPS 180-4, testowana wektorami NIST) -- zero zależności od `sha256sum`/
+`shasum`/`openssl` do tego celu. Identyczny wynik na każdej platformie,
+bez procesu potomnego per plik (szybciej niż poprzednie fork+exec).
+(Wcześniej `zpk` próbowało po kolei `sha256sum` → `shasum -a 256` →
+`openssl dgst -sha256`, cokolwiek znalazło w PATH -- ten kod został
+usunięty razem z resztą zależności od narzędzi zewnętrznych do budowania
+archiwum.)
 
 ## Publikacja: `zpk schedule-release`
 
