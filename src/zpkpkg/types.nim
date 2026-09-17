@@ -1,4 +1,4 @@
-import std/[times, tables]
+import std/[times, tables, os, strutils]
 
 ## Schemat `ZpkManifest`/`ZpkFileEntry` MUSI zostać zgodny 1:1 z tym, co
 ## zpm (src/zpmpkg/zpk.nim) umie zainstalować -- `zpk` to OFICJALNY
@@ -69,4 +69,20 @@ type
       ## toolchaina dla żadnej architektury (zachowanie jak wcześniej).
 
 proc nowIso8601*(): string =
+  ## v0.6 -- REPRODUKOWALNE BUDOWANIE: jeśli zmienna środowiskowa
+  ## `SOURCE_DATE_EPOCH` jest ustawiona (konwencja z reproducible-builds.org,
+  ## używana też przez Debiana i inne dystrybucje), znacznik czasu w
+  ## manifeście pochodzi z NIEJ zamiast z zegara systemowego -- dwa
+  ## buildy tego samego `zpk.build`+recipe, z tym samym
+  ## `SOURCE_DATE_EPOCH`, dają wtedy BAJT-W-BAJT identyczny `.zpk`
+  ## (patrz `tests/test_reproducible.nim`). Bez tej zmiennej: zachowanie
+  ## jak wcześniej (bieżący czas UTC) -- buildy pozostają NIEreprodukowalne
+  ## domyślnie, bo to najbezpieczniejszy wybór dla kogoś, kto o tym nie wie.
+  let sourceDateEpoch = getEnv("SOURCE_DATE_EPOCH")
+  if sourceDateEpoch.len > 0:
+    try:
+      let epochSeconds = parseInt(sourceDateEpoch)
+      return fromUnix(epochSeconds).utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+    except ValueError:
+      discard  # SOURCE_DATE_EPOCH nie jest liczbą -- ignorujemy, jak niżej
   now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
